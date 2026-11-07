@@ -150,6 +150,25 @@ class TelegramChannel(Channel):
         from core.documents import inbox_dir
         self._inbox_dir = inbox_dir(config)
 
+        # Group chat support — populated at startup
+        self._my_username = None  # The bot's own @username (lowercased, no @)
+        self._pulse_root = config.get("_pulse_root", "")
+        # Group chat budget per topic per bot (default 3 messages)
+        self._group_chat_budget = int(config.get("channels", {}).get("telegram", {}).get("group_budget", 3))
+
+        # Media-group buffering — Telegram albums arrive as separate photo updates
+        # sharing a media_group_id. We collect them, debounce, then dispatch
+        # all photos to the engine as one multi-image turn so the companion
+        # responds once with full context instead of once per image.
+        self._media_groups: dict[str, dict] = {}
+        self._media_group_lock = asyncio.Lock()
+        # Time to wait after the last album photo arrives before dispatching.
+        # Only references are buffered (no downloads in the hot path), so
+        # this measures Telegram's fast server-side album delivery — 2.5s
+        # is comfortably more than enough without feeling laggy.
+        self._media_group_debounce_s = 2.5
+        self._media_group_max = 10  # Telegram's own album cap
+
     def set_engine(self, engine):
         """Connect the engine so incoming messages can trigger responses."""
         self._engine = engine
@@ -224,6 +243,14 @@ class TelegramChannel(Channel):
             self._on_document
         ))
 
+        # Animation handler — gifs (Telegram delivers these as .animation, usually
+        # a silent mp4). We slice a few frames into one labeled contact sheet so a
+        # vision model can actually SEE the motion instead of a single frozen frame.
+        self.app.add_handler(MessageHandler(
+            filters.ANIMATION,
+            self._on_animation
+        ))
+
         # Callback query handler — for inline buttons (e.g. 🔊 voice button)
         self.app.add_handler(CallbackQueryHandler(self._on_callback))
 
@@ -247,6 +274,13 @@ class TelegramChannel(Channel):
         # Start polling in the background (non-blocking)
         await self.app.initialize()
         await self.app.start()
+        # Fetch our own bot's username for group chat mention detection
+        try:
+            me = await self.app.bot.get_me()
+            self._my_username = (me.username or "").lower()
+            logger.info(f"Telegram bot identity: @{self._my_username}")
+        except Exception as e:
+            logger.warning(f"Could not fetch bot username: {e}")
         await self.app.updater.start_polling(
             drop_pending_updates=True,
             # Short polling timeout = faster recovery after sleep/wake network loss.
@@ -1061,10 +1095,67 @@ class TelegramChannel(Channel):
         """
         try:
             if not self._engine:
-                await update.message.reply_text("I'm still starting up, give me a moment...")
+                # In group chats, stay silent rather than spam an "I'm starting up" reply
+                from core.group_chat import is_group_chat
+                if not is_group_chat(update):
+                    await update.message.reply_text("I'm still starting up, give me a moment...")
                 return
 
             user_message = update.message.text
+
+            # === Group chat handling ===
+            from core.group_chat import (
+                is_group_chat, is_message_from_bot, parse_mentions,
+                get_topic_state, start_new_topic, is_bot_eligible,
+                get_bot_budget_remaining, record_bot_response, topic_matches,
+            )
+            from pathlib import Path
+            import random
+            import asyncio as _asyncio
+
+            if is_group_chat(update):
+                if not self._my_username:
+                    logger.debug("Group message ignored: bot username not yet known")
+                    return
+
+                pulse_root = Path(self._pulse_root) if self._pulse_root else Path(".")
+                chat_id = str(update.effective_chat.id)
+                msg_id = update.message.message_id
+                from_bot = is_message_from_bot(update)
+                entities = update.message.entities or []
+
+                if from_bot:
+                    # Message from another bot. Treat as continuation of current topic.
+                    topic = get_topic_state(pulse_root, chat_id)
+                    if not topic:
+                        logger.debug("Bot message in group with no active topic — ignoring")
+                        return
+                    # Don't respond to ourselves
+                    sender_username = (update.effective_user.username or "").lower()
+                    if sender_username == self._my_username:
+                        return
+                    if not is_bot_eligible(topic, self._my_username):
+                        logger.debug(f"@{self._my_username} not tagged in current topic — ignoring bot reply")
+                        return
+                    if get_bot_budget_remaining(topic, self._my_username) <= 0:
+                        logger.debug(f"@{self._my_username} budget exhausted — ignoring bot reply")
+                        return
+                    # Add a random delay so bots don't all reply simultaneously
+                    await _asyncio.sleep(random.uniform(2.0, 15.0))
+                else:
+                    # Message from a human — start a new topic
+                    mentioned, everyone = parse_mentions(user_message, entities)
+                    start_new_topic(
+                        pulse_root, chat_id, msg_id, mentioned, everyone,
+                        budget=self._group_chat_budget,
+                    )
+                    topic = get_topic_state(pulse_root, chat_id)
+                    if not is_bot_eligible(topic, self._my_username):
+                        logger.debug(f"@{self._my_username} not tagged in new topic — ignoring")
+                        return
+                    # Random delay for natural response timing
+                    await _asyncio.sleep(random.uniform(0.5, 8.0))
+
             logger.info(f"Telegram message from user: {user_message[:50]}...")
 
             # Reply-to-edit: if user replies to a pending voice draft, apply correction and send
@@ -1160,80 +1251,322 @@ class TelegramChannel(Channel):
                 if sent and msg_db_ids:
                     self._engine.db.update_message_channel_id(msg_db_ids[-1], sent.message_id)
             elif not voice_sent:
-                error = getattr(self._engine.llm, "last_error", "") if self._engine else ""
-                reason = f": {error}" if error else ""
-                await self._reply_with_retry(
-                    reply_update.message,
-                    f"(I'm having trouble thinking right now{reason})"
-                )
+                # In group chats, stay silent on errors rather than spam warnings
+                from core.group_chat import is_group_chat as _is_group
+                if not _is_group(reply_update):
+                    error = getattr(self._engine.llm, "last_error", "") if self._engine else ""
+                    reason = f": {error}" if error else ""
+                    await self._reply_with_retry(
+                        reply_update.message,
+                        f"(I'm having trouble thinking right now{reason})"
+                    )
+
+            # Group chat: record this response against our budget for the topic
+            from core.group_chat import is_group_chat as _is_group2, record_bot_response
+            if _is_group2(reply_update) and self._my_username and (reply or voice_sent):
+                from pathlib import Path as _P
+                pulse_root = _P(self._pulse_root) if self._pulse_root else _P(".")
+                chat_id = str(reply_update.effective_chat.id)
+                record_bot_response(pulse_root, chat_id, self._my_username)
         except Exception as e:
             logger.error(f"Accumulated message processing crashed: {e}", exc_info=True)
             try:
-                await reply_update.message.reply_text(
-                    "(Something went wrong on my end — check the logs!)"
-                )
+                from core.group_chat import is_group_chat as _is_group3
+                if not _is_group3(reply_update):
+                    await reply_update.message.reply_text(
+                        "(Something went wrong on my end — check the logs!)"
+                    )
             except Exception:
                 pass
 
     async def _on_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle incoming photo messages — download, base64 encode, send to companion."""
+        """Handle incoming photo messages.
+
+        Single photo → dispatch immediately. Photo that's part of a Telegram
+        media group (album) → buffer by media_group_id, debounce, then
+        dispatch all photos in one multi-image turn so the companion sees
+        the whole album at once.
+        """
         try:
             if not self._engine:
                 await update.message.reply_text("I'm still starting up, give me a moment...")
                 return
 
-            # Get the highest resolution photo (last in the list)
+            # Highest resolution photo (metadata only — NO download yet)
             photo = update.message.photo[-1]
-            caption = update.message.caption or "What do you see in this image?"
-            self._last_user_message = caption
+            group_id = update.message.media_group_id
 
-            logger.info(f"Telegram photo from user ({photo.width}x{photo.height}, caption: {caption[:50]}...)")
+            # Batch key. Prefer Telegram's album id — but in practice photos
+            # very often arrive with NO media_group_id (each delivered as its
+            # own message), which is exactly why sending several used to fire a
+            # reply PER photo. So when there's no album id, fall back to the
+            # chat id: any photos that land in the same chat within the
+            # debounce window get collected into ONE turn regardless of whether
+            # Telegram tagged them as an album. Cost: a lone photo now waits
+            # out the debounce (~2.5s) before dispatch — a small, worthwhile
+            # price for never spamming a reply-per-image again.
+            if group_id:
+                batch_key = f"mg:{group_id}"
+            else:
+                batch_key = f"chat:{update.effective_chat.id}"
 
-            # Keep typing indicator alive through download + generation
-            typing_task = self._start_typing_loop(update.effective_chat)
-            try:
-                # Download the photo as bytes
-                photo_bytes = await self._download_photo_with_retry(photo)
+            # CRITICAL: do NOT download here. Downloading a full-res phone photo
+            # can take longer than the debounce window and collapse the batch
+            # into per-photo dispatches. Buffer the lightweight PhotoSize
+            # reference instantly; download once the batch is complete, in
+            # _media_group_dispatch_after_delay.
+            async with self._media_group_lock:
+                entry = self._media_groups.get(batch_key)
+                if entry is None:
+                    entry = {
+                        "photos": [],
+                        "caption": None,
+                        "first_message": update.message,
+                        "timer": None,
+                    }
+                    self._media_groups[batch_key] = entry
 
-                # Convert to base64 data URI
-                b64 = base64.b64encode(photo_bytes).decode("utf-8")
-                image_url = f"data:image/jpeg;base64,{b64}"
+                if len(entry["photos"]) >= self._media_group_max:
+                    logger.warning(
+                        f"Photo batch {batch_key} exceeded {self._media_group_max} photos — dropping extra"
+                    )
+                    return
 
-                logger.info(f"Photo downloaded: {len(photo_bytes)} bytes, sending to LLM...")
+                entry["photos"].append(photo)
+                # Only the first photo in an album carries the caption; capture
+                # whichever caption appears first (order isn't guaranteed).
+                if update.message.caption and not entry["caption"]:
+                    entry["caption"] = update.message.caption
 
-                # Get response from companion via the engine (with image)
-                reply, tools_used, reasoning, msg_db_ids = await self._engine.handle_message(
-                    caption, source="telegram", image_url=image_url,
-                    channel_message_id=update.message.message_id
+                if entry["timer"] is not None and not entry["timer"].done():
+                    entry["timer"].cancel()
+                entry["timer"] = asyncio.create_task(
+                    self._media_group_dispatch_after_delay(batch_key)
                 )
-            finally:
-                typing_task.cancel()
+                buffered_count = len(entry["photos"])
 
-            voice_sent = await self._send_pending_skill_output(
-                update.message, reply or "", tools_used
+            logger.info(
+                f"Photo batch {batch_key}: buffered (now {buffered_count}, "
+                f"debouncing {self._media_group_debounce_s}s)"
             )
-            if self._show_reasoning and reasoning:
-                await self._send_reasoning(update.message, reasoning)
-            if tools_used:
-                tool_names = ", ".join(dict.fromkeys(tools_used))
-                await self._reply_with_retry(update.message, f"🔧 {tool_names}")
-            if reply:
-                sent = await self._reply_with_retry(
-                    update.message, reply, reply_markup=self._voice_markup(),
-                    markdown=True
-                )
-                if sent and msg_db_ids:
-                    self._engine.db.update_message_channel_id(msg_db_ids[-1], sent.message_id)
-            elif not voice_sent:
-                await self._reply_with_retry(
-                    update.message,
-                    "(I can't process images right now — the model might not support vision, "
-                    "or the LLM server might be down)"
-                )
         except Exception as e:
             logger.error(f"Photo handler crashed: {e}", exc_info=True)
             try:
                 await update.message.reply_text("(Something went wrong processing that image — check the logs!)")
+            except Exception:
+                pass
+
+    async def _download_photo_data_uri(self, photo) -> str:
+        """Download a Telegram PhotoSize and return it as a base64 data URI."""
+        photo_bytes = await self._download_photo_with_retry(photo)
+        b64 = base64.b64encode(photo_bytes).decode("utf-8")
+        return f"data:image/jpeg;base64,{b64}"
+
+    async def _media_group_dispatch_after_delay(self, batch_key: str):
+        """Wait out the debounce, download the whole batch, then dispatch once."""
+        try:
+            await asyncio.sleep(self._media_group_debounce_s)
+        except asyncio.CancelledError:
+            return
+
+        async with self._media_group_lock:
+            entry = self._media_groups.pop(batch_key, None)
+        if not entry or not entry["photos"]:
+            return
+
+        photo_refs = entry["photos"]
+        first_message = entry["first_message"]
+        caption = entry["caption"] or (
+            "What do you see in this image?" if len(photo_refs) == 1
+            else "What do you see in these images?"
+        )
+
+        logger.info(
+            f"Photo batch {batch_key}: complete ({len(photo_refs)} photo(s)) — "
+            f"downloading all before dispatch..."
+        )
+        image_urls: list[str] = []
+        for ph in photo_refs:
+            try:
+                image_urls.append(await self._download_photo_data_uri(ph))
+            except Exception as e:
+                logger.warning(f"Photo batch {batch_key}: a photo failed to download: {e}")
+
+        if not image_urls:
+            logger.warning(f"Photo batch {batch_key}: no photos downloaded — skipping dispatch")
+            return
+
+        logger.info(
+            f"Photo batch {batch_key}: dispatching {len(image_urls)} image(s) — "
+            f"caption: {caption[:50]!r}"
+        )
+        try:
+            await self._dispatch_photo_turn(first_message, caption, image_urls)
+        except Exception as e:
+            logger.error(f"Media group dispatch crashed: {e}", exc_info=True)
+            try:
+                await first_message.reply_text(
+                    "(Something went wrong processing that batch of images — check the logs!)"
+                )
+            except Exception:
+                pass
+
+    async def _dispatch_photo_turn(self, message, caption: str, image_urls: list[str]):
+        """Send one or more images to the engine and deliver the reply.
+
+        Shared by the single-photo and media-group paths so reasoning,
+        tools, voice output, and reply formatting behave identically.
+        """
+        self._last_user_message = caption
+        typing_task = self._start_typing_loop(message.chat)
+        try:
+            reply, tools_used, reasoning, msg_db_ids = await self._engine.handle_message(
+                caption, source="telegram", image_urls=image_urls,
+                channel_message_id=message.message_id
+            )
+        finally:
+            typing_task.cancel()
+
+        voice_sent = await self._send_pending_skill_output(
+            message, reply or "", tools_used
+        )
+        if self._show_reasoning and reasoning:
+            await self._send_reasoning(message, reasoning)
+        if tools_used:
+            tool_names = ", ".join(dict.fromkeys(tools_used))
+            await self._reply_with_retry(message, f"🔧 {tool_names}")
+        if reply:
+            sent = await self._reply_with_retry(
+                message, reply, reply_markup=self._voice_markup(),
+                markdown=True
+            )
+            if sent and msg_db_ids:
+                self._engine.db.update_message_channel_id(msg_db_ids[-1], sent.message_id)
+        elif not voice_sent:
+            await self._reply_with_retry(
+                message,
+                "(I can't process images right now — the model might not support vision, "
+                "or the LLM server might be down)"
+            )
+
+    @staticmethod
+    def _ffmpeg_path() -> str | None:
+        """ffmpeg: system PATH first, then Pulse's bundled whisper copy (same one TTS uses)."""
+        import shutil
+        found = shutil.which("ffmpeg")
+        if found:
+            return found
+        bundled = Path(__file__).resolve().parent.parent / "data" / "whisper" / "ffmpeg.exe"
+        return str(bundled) if bundled.exists() else None
+
+    def _animation_to_sheet(self, data: bytes) -> str | None:
+        """Turn a gif / short mp4 into ONE labeled contact-sheet JPEG — a flipbook of up to
+        ~6 evenly spaced frames — returned as a base64 data URI. One image keeps the API cost
+        of a gif about the same as a single photo. Sync; call via asyncio.to_thread. Returns
+        None on any failure, and the caller handles the fallback."""
+        import io
+        import math
+        import re
+        import subprocess
+        import tempfile
+        ffmpeg = self._ffmpeg_path()
+        if not ffmpeg:
+            logger.warning("Animation -> sheet: ffmpeg not found")
+            return None
+        try:
+            from PIL import Image, ImageDraw
+        except Exception:
+            logger.warning("Animation -> sheet: Pillow not available")
+            return None
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                tdp = Path(td)
+                src = tdp / "in.bin"
+                src.write_bytes(data)
+                probe = subprocess.run([ffmpeg, "-i", str(src)], capture_output=True, text=True, timeout=30)
+                m = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", probe.stderr or "")
+                dur = (int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))) if m else 0.0
+                target = 6
+                fps = (target / dur) if dur > 0.25 else 3.0
+                fps = max(0.5, min(12.0, fps))
+                subprocess.run(
+                    [ffmpeg, "-y", "-i", str(src),
+                     "-vf", f"fps={fps:.4f},scale='min(360,iw)':-2",
+                     "-frames:v", str(target), str(tdp / "f_%02d.jpg")],
+                    capture_output=True, text=True, timeout=60,
+                )
+                frames = sorted(tdp.glob("f_*.jpg"))
+                if not frames:
+                    return None
+                imgs = [Image.open(f).convert("RGB") for f in frames]
+                cols = min(3, len(imgs))
+                rows = math.ceil(len(imgs) / cols)
+                cw = max(i.width for i in imgs)
+                ch = max(i.height for i in imgs)
+                pad, lab = 6, 18
+                sheet = Image.new(
+                    "RGB",
+                    (cols * cw + (cols + 1) * pad, rows * (ch + lab) + (rows + 1) * pad),
+                    (22, 18, 30),
+                )
+                draw = ImageDraw.Draw(sheet)
+                for i, im in enumerate(imgs):
+                    r, c = divmod(i, cols)
+                    x = pad + c * (cw + pad)
+                    y = pad + r * (ch + lab + pad)
+                    draw.text((x + 2, y + 2), f"frame {i + 1}", fill=(232, 212, 250))
+                    sheet.paste(im, (x, y + lab))
+                buf = io.BytesIO()
+                sheet.save(buf, "JPEG", quality=85)
+                return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
+        except Exception as e:
+            logger.warning(f"Animation -> sheet failed: {e}")
+            return None
+
+    async def _handle_motion_media(self, message, media,
+                                   caption_default=(
+                                       "Someone sent you an animated gif. Below is a contact sheet of its "
+                                       "frames in order (left to right, top to bottom) so you can see the "
+                                       "motion — react to it as the moving gif it is, not as separate photos."
+                                   )) -> bool:
+        """Download a gif / short clip — a Telegram .animation OR a gif/video sent as a document —
+        slice it into one labeled contact sheet, and dispatch it through the normal image path.
+        Returns True if handled (including a 'too big' reply), False to fall back."""
+        if getattr(media, "file_size", 0) and media.file_size > 20 * 1024 * 1024:
+            await self._reply_with_retry(
+                message, "(That gif/clip's a bit big for me to grab — Telegram caps me at ~20MB!)"
+            )
+            return True
+        typing_task = self._start_typing_loop(message.chat)
+        try:
+            tg_file = await media.get_file()
+            raw = bytes(await tg_file.download_as_bytearray())
+            logger.info(f"Motion media received ({len(raw):,} bytes) — building contact sheet")
+            sheet = await asyncio.to_thread(self._animation_to_sheet, raw)
+        finally:
+            typing_task.cancel()
+        if not sheet:
+            return False
+        caption = (getattr(message, "caption", None) or "").strip() or caption_default
+        await self._dispatch_photo_turn(message, caption, [sheet])
+        return True
+
+    async def _on_animation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Incoming gif via Telegram's gif picker (.animation). Gifs sent as a FILE arrive as a
+        document instead and get routed here from _on_document; both share _handle_motion_media."""
+        try:
+            if not self._engine:
+                await update.message.reply_text("I'm still starting up, give me a moment...")
+                return
+            anim = update.message.animation
+            if anim is None:
+                return
+            if not await self._handle_motion_media(update.message, anim):
+                await update.message.reply_text("(I couldn't read that gif — check the logs!)")
+        except Exception as e:
+            logger.error(f"Animation handler crashed: {e}", exc_info=True)
+            try:
+                await update.message.reply_text("(Something went wrong with that gif — check the logs!)")
             except Exception:
                 pass
 
@@ -1296,6 +1629,15 @@ class TelegramChannel(Channel):
                     "download files up to ~19MB.)"
                 )
                 return
+
+            # A gif or short video sent as a FILE lands here as a document (e.g. "name.gif.mp4").
+            # Route it through the frame-slicer so the companion sees the motion instead of being
+            # told it's "a video I can't read." If slicing fails, fall through to normal handling.
+            mime = (getattr(doc, "mime_type", "") or "").lower()
+            if (mime.startswith("video/") or mime == "image/gif"
+                    or filename.lower().endswith((".gif", ".mp4", ".webm", ".mov", ".m4v", ".mkv"))):
+                if await self._handle_motion_media(update.message, doc):
+                    return
 
             typing_task = self._start_typing_loop(update.effective_chat)
             try:

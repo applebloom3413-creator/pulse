@@ -77,6 +77,11 @@ provider:
   # Anthropic only: beta cache diagnostics. Enable temporarily to log miss
   # reasons such as system_changed, tools_changed, or messages_changed.
   cache_diagnostics: false
+  # Optional captioner (Anthropic vision only). When set, every incoming image
+  # is captioned once at ingest so its content stays in conversation history
+  # as text after the raw image is dropped. Leave blank to disable.
+  # Example: "claude-haiku-4-5-20251001"
+  captioning_model: ""
 
 # --- Heartbeat ---
 heartbeat:

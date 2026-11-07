@@ -1494,7 +1494,8 @@ You decide when to lift the timeout — not the human."""
     def build_conversation_prompt(self, user_message: str, history: list[dict] = None,
                                    image_url: str = None, timeout_state: dict = None,
                                    skill_summary: list[dict] = None,
-                                   on_demand_manifest: list[dict] = None) -> list[dict]:
+                                   on_demand_manifest: list[dict] = None,
+                                   image_urls: list[str] | None = None) -> list[dict]:
         """Build a prompt for responding to a message from the user.
 
         Unlike heartbeat prompts, this includes conversation history and
@@ -1504,8 +1505,14 @@ You decide when to lift the timeout — not the human."""
             user_message: The user's text message
             history: Previous conversation messages
             image_url: Optional base64 data URI for vision (e.g. "data:image/jpeg;base64,...")
+            image_urls: Optional list of data URIs — several images (e.g. a
+                Telegram album) attached to this one turn. Used instead of
+                image_url when given.
         """
         local_now = datetime.now()
+        images = [u for u in (image_urls or []) if u]
+        if image_url and not images:
+            images = [image_url]
 
         # System prompt — persona + operational instructions for conversation mode
         persona = self._compose_persona()
@@ -1661,23 +1668,19 @@ You decide when to lift the timeout — not the human."""
             + f"\n\n{self.user_name}'s new message:"
         )})
 
-        # Add the current message (with optional image for vision models)
-        if image_url:
-            # Multi-part content: text + image (OpenAI vision API format)
-            messages.append({
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_message},
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                ],
-            })
+        # Add the current message (with optional images for vision models)
+        if images:
+            # Multi-part content: text + image(s) (OpenAI vision API format)
+            content = [{"type": "text", "text": user_message}]
+            for url in images:
+                content.append({"type": "image_url", "image_url": {"url": url}})
+            messages.append({"role": "user", "content": content})
         else:
             messages.append({"role": "user", "content": user_message})
 
         current_message_measure = [
             {"type": "text", "text": user_message},
-            {"type": "image_url"} if image_url else "",
-        ]
+        ] + [{"type": "image_url"} for _ in images]
         self._log_context_breakdown("conversation", messages, [
             ("stable_system", conv_system),
             ("tool_menu", skill_menu),

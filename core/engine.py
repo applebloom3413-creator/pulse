@@ -11,6 +11,7 @@ This is the main orchestrator. It:
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -28,6 +29,28 @@ from core.scheduler import ScheduleManager
 from core.archive_enrichment import run_one_idle_enrichment
 
 logger = logging.getLogger(__name__)
+
+
+# System prompt for the image captioner. Kept short and directive because the
+# caption REPLACES the image in the persona's long-term memory of the
+# conversation — so future re-reads must be able to reconstruct what was
+# shared from the caption alone.
+CAPTION_SYSTEM_PROMPT = (
+    "You are producing a text description of an image that a human just shared "
+    "in a conversation with an AI companion. Your caption will REPLACE the "
+    "image in the companion's memory after this turn, so the caption alone "
+    "must let a future reader reconstruct what was shared.\n\n"
+    "Include (as applicable):\n"
+    "- Image type (screenshot, photo, drawing, meme, diagram, etc.)\n"
+    "- Any visible text, verbatim if short, summarized if long\n"
+    "- What is happening visually\n"
+    "- If it is a screenshot of a conversation: who is speaking, what they "
+    "said, any tone signals\n"
+    "- Emotional / tonal signals worth preserving\n\n"
+    "Be factual and direct. No preamble like \"This image shows...\" — "
+    "describe directly. Aim for 100-250 words; shorter for simple images, "
+    "longer for dense screenshots. Do not editorialize or add commentary."
+)
 
 
 class PulseEngine:
@@ -122,6 +145,68 @@ class PulseEngine:
                 provider_type=provider_type,
             )
         self.llm._provider_name = provider_type
+
+        # Optional captioner LLM — for image-captioning at ingest.
+        # When provider.captioning_model is set, incoming images get a one-time
+        # text description that persists in conversation history. Without this,
+        # images are dropped to "[sent an image]" after the immediate turn and
+        # the persona has no memory of what was shared. A small vision model
+        # (e.g. Haiku 4.5) costs very little next to the main model.
+        captioner_model = provider_config.get("captioning_model", "")
+        if captioner_model and provider_type == "anthropic":
+            self.captioner_llm = AnthropicClient(
+                endpoint=endpoint,
+                model_name=captioner_model,
+                temperature=0.3,          # low temp for consistent factual captions
+                max_tokens=500,           # caps caption length — ~300-400 tokens typical
+                top_p=1.0,
+                api_key=api_key,
+                usage_tracker=usage_tracker,
+                cache_ttl="5m",           # captions aren't re-read; caching irrelevant
+                cache_automatic=False,
+            )
+            self.captioner_llm._provider_name = provider_type
+            logger.info(f"Captioner LLM: routing image-caption-at-ingest to {captioner_model} (persona stays on {model_name})")
+        elif captioner_model:
+            # Captioner for NON-Anthropic personas too —
+            # any OpenAI-compatible vision model. Defaults to the persona's own
+            # provider/endpoint/key; or set provider.captioning_provider:
+            # "openrouter" to route captions through OpenRouter (key from
+            # OPENROUTER_API_KEY, or provider.captioning_api_key_env).
+            cap_provider = provider_config.get("captioning_provider", provider_type)
+            cap_endpoint, cap_key = endpoint, api_key
+            if cap_provider != provider_type or provider_config.get("captioning_endpoint"):
+                cap_endpoint = provider_config.get("captioning_endpoint") or (
+                    "https://openrouter.ai/api/v1" if cap_provider == "openrouter" else endpoint)
+                key_env = provider_config.get("captioning_api_key_env") or (
+                    "OPENROUTER_API_KEY" if cap_provider == "openrouter" else "")
+                cap_key = os.environ.get(key_env, "") if key_env else api_key
+            if cap_provider == "anthropic":
+                logger.warning("captioning_provider 'anthropic' only works on Anthropic personas — captioner off")
+                self.captioner_llm = None
+            else:
+                self.captioner_llm = LLMClient(
+                    endpoint=cap_endpoint,
+                    model_name=captioner_model,
+                    temperature=0.3,
+                    max_tokens=500,
+                    api_key=cap_key,
+                    usage_tracker=usage_tracker,
+                    provider_type=cap_provider,
+                )
+                self.captioner_llm._provider_name = cap_provider
+                logger.info(f"Captioner LLM ({cap_provider}): routing image-caption-at-ingest to "
+                            f"{captioner_model} (persona stays on {model_name})")
+        else:
+            self.captioner_llm = None
+
+        # provider.vision: false — for models that can't
+        # see (GLM, DeepSeek, ...). Incoming images are captioned FIRST and the
+        # description is sent instead of the picture, so a blind model still
+        # knows what was shared. Needs a captioning_model to be useful.
+        self.vision = provider_config.get("vision", True)
+        if not self.vision:
+            logger.info("Vision off for this model — images will be described to it via the captioner")
 
         self.max_tool_rounds = model_config.get("max_tool_rounds", 5)
         self.default_tool_loop_mode = model_config.get("tool_loop_mode", "capped")
@@ -815,9 +900,60 @@ class PulseEngine:
 
         return tg_msg_id
 
+    async def _caption_image(self, image_url: str) -> str:
+        """Generate a text description of one image via the captioner LLM.
+
+        Returns empty string on failure or if captioning is disabled. Callers
+        must treat empty as "no caption available" and fall back to the plain
+        marker. Runs the sync chat call in a thread so we don't block the
+        event loop.
+        """
+        if not self.captioner_llm:
+            return ""
+        prompt = [
+            {"role": "system", "content": CAPTION_SYSTEM_PROMPT},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Describe this image for future memory."},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ]},
+        ]
+        try:
+            # One-shot utility call: use the uncached path where the client
+            # has one (Anthropic), plain chat() otherwise.
+            caption_chat = getattr(self.captioner_llm, "chat_uncached", self.captioner_llm.chat)
+            response = await asyncio.to_thread(caption_chat, prompt)
+            if response and response.raw:
+                return response.raw.strip()
+        except Exception as e:
+            logger.warning(f"Image caption failed: {e}")
+        return ""
+
+    async def _caption_images(self, image_urls: list[str]) -> list[str]:
+        """Caption a batch of images in parallel. Returns a list aligned with
+        image_urls; entries are empty strings on individual failures."""
+        if not image_urls or not self.captioner_llm:
+            return []
+        return await asyncio.gather(*[self._caption_image(u) for u in image_urls])
+
+    @staticmethod
+    def _image_history_note(image_urls: list[str], captions: list[str]) -> str:
+        """Text that stands in for the images in persisted conversation history."""
+        if not image_urls:
+            return ""
+        if not any(captions):
+            # Captioning disabled or every attempt failed — plain marker fallback
+            if len(image_urls) == 1:
+                return " [sent an image]"
+            return f" [sent {len(image_urls)} images]"
+        if len(image_urls) == 1:
+            return f" [image sent: {captions[0]}]"
+        parts = [f"  {i}. {cap or '(caption failed)'}" for i, cap in enumerate(captions, 1)]
+        return f" [sent {len(image_urls)} images:\n" + "\n".join(parts) + "\n]"
+
     async def handle_message(self, message: str, source: str = "telegram",
                             image_url: str = None,
-                            channel_message_id: int = None) -> tuple[str, list[str], str, list[int]]:
+                            channel_message_id: int = None,
+                            image_urls: list[str] | None = None) -> tuple[str, list[str], str, list[int]]:
         """Handle an incoming message and return the companion's response.
 
         This is for bidirectional chat (Telegram, future voice, etc.).
@@ -829,10 +965,15 @@ class PulseEngine:
         Args:
             message: The user's message text
             source: Where the message came from ("telegram", "voice", etc.)
-            image_url: Optional base64 data URI for an image (vision models)
+            image_url: Optional base64 data URI for one image (vision models)
+            channel_message_id: Optional channel-side id of the incoming message
+            image_urls: Optional list of base64 data URIs — several images
+                (e.g. a Telegram album) attached to one turn. Used instead of
+                image_url when given.
 
         Returns:
-            Tuple of (companion's response text, list of tools used, reasoning).
+            Tuple of (companion's response text, list of tools used, reasoning,
+            new conversation-history DB ids).
             `reasoning` is the captured chain of thought if the model exposed
             any (via reasoning_content / reasoning fields / <think> tags),
             otherwise an empty string. The channel decides whether to display
@@ -862,15 +1003,36 @@ class PulseEngine:
         # Load conversation history
         history = self.context._load_conversation()
 
-        # Build conversation prompt (with optional image)
+        # One image (image_url) or several (image_urls, e.g. a Telegram album)
+        image_urls = [u for u in (image_urls or []) if u]
+        if image_url and not image_urls:
+            image_urls = [image_url]
+
+        # Blind model (provider.vision: false): describe the images first and
+        # send the descriptions instead of the pictures.
+        pre_captions: list[str] = []
+        model_images = image_urls or None
+        model_message = message          # what the model sees this turn (history keeps `message`)
+        if image_urls and not self.vision:
+            pre_captions = await self._caption_images(image_urls)
+            notes = []
+            for i, cap in enumerate(pre_captions or [""] * len(image_urls), 1):
+                label = "image" if len(image_urls) == 1 else f"image {i}"
+                notes.append(f"[{label}: {cap}]" if cap else
+                             f"[{label} sent — you can't see images, and it couldn't be described this time]")
+            model_message = (message + "\n" if message else "") + "\n".join(notes)
+            model_images = None
+
+        # Build conversation prompt (with optional images)
         skill_summary = self.skill_registry.get_skill_summary() if self.skill_registry else []
         on_demand_manifest = self.skill_registry.get_on_demand_manifest() if self.skill_registry else []
         messages = self.context.build_conversation_prompt(
-            message, history, image_url=image_url, timeout_state=timeout_state,
+            model_message, history, image_urls=model_images, timeout_state=timeout_state,
             skill_summary=skill_summary, on_demand_manifest=on_demand_manifest
         )
-        logger.info(f"Sending {len(messages)} messages to LLM for {source} reply"
-                     f"{' (with image)' if image_url else ''}...")
+        n_images = len(image_urls)
+        image_tag = "" if not n_images else (" (with image)" if n_images == 1 else f" (with {n_images} images)")
+        logger.info(f"Sending {len(messages)} messages to LLM for {source} reply{image_tag}...")
 
         # Get response — run in thread so we don't block the event loop!
         # If skills are available, use tool-calling mode; otherwise plain chat.
@@ -938,18 +1100,33 @@ class PulseEngine:
         else:
             history_reply = reply or skill_text
 
+        # Images themselves are too large to persist as raw data, so they are
+        # dropped from history after this turn. If captioning is enabled, each
+        # image is captioned first so its content survives as text; without
+        # that the persona only ever sees "[sent an image]" later. Captioning
+        # runs AFTER the reply so it never adds to the perceived response time.
+        captions: list[str] = list(pre_captions)
+        if image_urls and self.captioner_llm and not captions:
+            t_cap = time.time()
+            captions = await self._caption_images(image_urls)
+            n_ok = sum(1 for c in captions if c)
+            logger.info(
+                f"Captioned {n_ok}/{len(image_urls)} image(s) in "
+                f"{time.time() - t_cap:.1f}s (captioner: {self.captioner_llm.model_name})"
+            )
+
+        # Timestamps help the companion understand temporal flow
+        timestamp = datetime.now().strftime("[%b %d, %I:%M %p]")
+        image_note = self._image_history_note(image_urls, captions)
+
         # Persist the user's message to history even when there's no reply to
         # store. Otherwise an empty reply (e.g. wake-up housekeeping) silently
         # discards the incoming message, and the companion loses all memory of
         # it — exactly the "I never received your first message" symptom.
-        timestamp = datetime.now().strftime("[%b %d, %I:%M %p]")
-        image_note = " [sent an image]" if image_url else ""
         if not history_reply:
             history.append({"role": "user", "content": f"{timestamp} {message}{image_note}"})
             return None, tools_used, reasoning, self.context.save_conversation(history)
 
-        # Update conversation history (store text only — images are too large to persist)
-        # Timestamps help the companion understand temporal flow
         history.append({"role": "user", "content": f"{timestamp} {message}{image_note}"})
         history.append({"role": "assistant", "content": history_reply})
 
