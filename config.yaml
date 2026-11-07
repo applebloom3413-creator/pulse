@@ -167,6 +167,15 @@ channels:
     enabled: false
     author_name: ""               # your companion's name
     model_name: "transient"
+  # Ask API (channels/ask_api.py): authenticated HTTP door, e.g. for a phone
+  # shortcut ("Hey Siri, ask <companion>") over a private network such as
+  # Tailscale. Off by default; enable per persona AND set ASK_API_TOKEN in
+  # that persona's .env, or it refuses to start. Never port-forward it.
+  ask_api:
+    enabled: false
+    host: "0.0.0.0"               # all interfaces; the token is still required
+    port: 8781                    # give each persona its own port
+    echo_to_telegram: true        # also post each Q&A to the persona's Telegram chat
   toast:
     enabled: true
     app_name: "Pulse"             # name shown in desktop notifications

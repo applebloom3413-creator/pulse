@@ -17,3 +17,7 @@ pypdf>=4.0                      # PDF text extraction for Telegram document mess
 
 # Note: plyer is an alternative to win11toast for cross-platform
 # pip install plyer
+
+# Optional extras (only for the side tools; install if you use them):
+# pip install telethon textual   # tui/app.py (multi-companion chat TUI)
+# pip install telethon pystray   # tools/outbox (send screenshots as an album)

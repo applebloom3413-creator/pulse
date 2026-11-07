@@ -10,6 +10,7 @@ With skills.lor.server_url set, it uses a LoR server in HTTP mode instead
 (home-server setup), with the same tools and texts.
 """
 
+import json
 import logging
 import math
 import os
@@ -891,10 +892,34 @@ class LoRSkill(BaseSkill):
 
         result = self.store.add_reaction(post_id, self.author_id, reaction)
         if result == "added":
+            self._record_reaction_time(post_id, reaction)
             return f"Reacted with {reaction} to post [{post_id}]"
         if result == "duplicate":
             return f"Already reacted with {reaction} to this post."
         return f"Post '{post_id}' not found."
+
+    def _record_reaction_time(self, post_id: str, reaction: str):
+        """Note when this reaction happened, for the Local Reddit window's
+        Activity tab (scripts/lor_gui.pyw); the forum store keeps no reaction
+        timestamps.
+
+        Only writes if reaction_times.json already exists — the window
+        creates it with a baseline of older reactions; creating it here
+        first would make every older reaction look brand new. Best-effort:
+        never lets a failure here affect the reaction itself."""
+        if not self.data_dir:
+            return
+        path = self.data_dir / "reaction_times.json"
+        if not path.exists():
+            return
+        try:
+            times = json.loads(path.read_text(encoding="utf-8"))
+            times[f"{post_id}|{reaction}|{self.author_id}"] = datetime.now(timezone.utc).isoformat()
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(times, indent=2, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, path)
+        except Exception as e:
+            logger.debug(f"Couldn't record LoR reaction time: {e}")
 
     def _my_posts(self, args: dict) -> str:
         """View own post history on LoR."""

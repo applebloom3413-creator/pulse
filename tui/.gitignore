@@ -1,0 +1,5 @@
+.env
+session/
+*.session
+*.session-journal
+personas.yaml
