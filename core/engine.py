@@ -25,6 +25,7 @@ except ImportError:
 from core.llm_openai import OpenAIResponsesClient
 from core.context import ContextManager
 from core.scheduler import ScheduleManager
+from core.recap_task import RecapTask
 from core.archive_enrichment import run_one_idle_enrichment
 
 logger = logging.getLogger(__name__)
@@ -166,6 +167,33 @@ class PulseEngine:
         self.dev_tick_max_rounds = dev_config.get("max_rounds", 8)
         self.dev_tick_schedule = dev_config.get("schedule_time", "")  # e.g. "20:00"
         self._pulse_root = str(Path(config.get("_pulse_root", ".")).resolve())
+
+        # Auto-recap — silently writes a story-so-far summary after sessions wrap.
+        # Safety net for when the AI doesn't proactively call save_recap.
+        recap_config = config.get("auto_recap", {})
+        self.auto_recap_enabled = recap_config.get("enabled", True)
+        self.recap_task = RecapTask(
+            self,
+            inactivity_minutes=recap_config.get("inactivity_minutes", 120),
+            cooldown_hours=recap_config.get("cooldown_hours", 4),
+            min_messages=recap_config.get("min_messages", 4),
+        )
+
+        # Backfill summaries from a standalone legacy archive (paths.legacy_db)
+        # into the memory pool as source='legacy' memories, so passive recall
+        # can surface them. Idempotent — skips when already imported.
+        legacy_db_path = str(config.get("paths", {}).get("legacy_db") or "").strip()
+        backfill_db = config.get("_shared_db") or self.db
+        if legacy_db_path and backfill_db and hasattr(backfill_db, "backfill_legacy_memories"):
+            legacy_path = Path(legacy_db_path)
+            if not legacy_path.is_absolute():
+                legacy_path = Path(self._pulse_root) / legacy_path
+            try:
+                imported = backfill_db.backfill_legacy_memories(str(legacy_path))
+                if imported:
+                    logger.info(f"Legacy backfill: imported {imported} memories")
+            except Exception as e:
+                logger.warning(f"Legacy backfill failed (non-fatal): {e}")
 
         self._running = False
         self._stop_event = asyncio.Event()
@@ -1520,6 +1548,15 @@ class PulseEngine:
                 self._last_error = None
                 # Always check for due tasks (fast — just reads a file)
                 await self._check_due_tasks()
+
+                # Auto-recap check — silent background save when sessions wrap.
+                # Cheap when conditions aren't met (timestamp + DB read); only
+                # fires the LLM call when it's actually time to recap.
+                if self.auto_recap_enabled:
+                    try:
+                        await self.recap_task.maybe_run()
+                    except Exception as e:
+                        logger.error(f"Auto-recap check failed: {e}", exc_info=True)
 
                 # Heartbeat fires only after enough silence since last activity
                 silence = time.time() - self._last_activity

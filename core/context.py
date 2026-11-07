@@ -11,7 +11,10 @@ so the companion remembers chats across sessions.
 import json
 import logging
 import glob
+import random
+import sqlite3
 import struct
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -123,6 +126,18 @@ class ContextManager:
         self.persona_data = self._load_persona()
         self.ai_name = self.persona_data.get("name", "Companion")
         self.user_name = self.persona_data.get("user_name", "User")
+        # What the companion affectionately calls the user (a nickname),
+        # distinct from their real name. Config or persona may set
+        # user_nickname; otherwise it falls back to the real name.
+        self.user_nickname = (
+            config.get("user_nickname")
+            or self.persona_data.get("user_nickname")
+            or self.user_name
+        )
+
+        # Cached conversation-archive summary line (computed once per process).
+        # None = not yet computed; "" = computed and nothing to show.
+        self._legacy_archive_line: Optional[str] = None
 
     def set_journal_skill(self, journal_skill):
         """Inject the JournalSkill so context can load pinned/recent entries."""
@@ -287,6 +302,33 @@ class ContextManager:
         if self._memories_are_shared and self._resident_id:
             session_logs = [m for m in session_logs if self._memory_is_own(m)]
         return max(session_logs, key=lambda x: x.get("date", ""), default=None)
+
+    def _recent_recaps(self, memories: list[dict]) -> list[dict]:
+        """Newest story-so-far recaps (type "recap") for the active resident.
+
+        Recaps are notes the companion leaves for its future self, by hand
+        (the save_recap tool) or via the auto-recap task (core/recap_task.py).
+        context.recent_recaps sets how many are shown (default 3, 0 = off).
+        """
+        try:
+            limit = int(self.config.get("context", {}).get("recent_recaps", 3))
+        except (TypeError, ValueError):
+            limit = 3
+        if limit <= 0:
+            return []
+        recaps = [m for m in memories if m.get("type") == "recap"]
+        if self._memories_are_shared and self._resident_id:
+            recaps = [m for m in recaps if self._memory_is_own(m)]
+        recaps.sort(key=lambda x: x.get("date", "") or "", reverse=True)
+        return recaps[:limit]
+
+    def _append_recaps(self, lines: list[str], recaps: list[dict]) -> None:
+        """Add the story-so-far recaps section to a memories block."""
+        if not recaps:
+            return
+        lines.append("\nStory so far (your recent recaps, newest first):")
+        for recap in recaps:
+            lines.append(f"\n{self._memory_date_prefix(recap)}\n{recap.get('text', '')}")
 
     def _load_journal_context(self) -> str:
         """Load pinned identity entries + recent transient entries for context."""
@@ -671,6 +713,7 @@ You decide when to lift the timeout — not the human."""
                     latest = latest_session_log
                     lines.append(f"\nLast session ({latest.get('date', 'unknown')[:10]}):")
                     lines.append(latest.get("text", ""))
+                self._append_recaps(lines, self._recent_recaps(memories))
                 if current_facts:
                     lines.append("\nStored facts (dated; old facts may be historical, not current):")
                     for fact in current_facts:
@@ -719,6 +762,7 @@ You decide when to lift the timeout — not the human."""
                 latest = latest_session_log
                 lines.append(f"\nLast session ({latest.get('date', 'unknown')[:10]}):")
                 lines.append(latest.get("text", ""))
+            self._append_recaps(lines, self._recent_recaps(memories))
             if current_facts:
                 lines.append("\nStored facts (dated; old facts may be historical, not current):")
                 for fact in current_facts:
@@ -767,6 +811,8 @@ You decide when to lift the timeout — not the human."""
 
         # Partition memories into core and pool
         latest_session_log = self._latest_session_log(memories)
+        recent_recaps = self._recent_recaps(memories)
+        recap_ids = {m.get("id") for m in recent_recaps}
 
         core_importance = recall_cfg.get("core_importance", 8)
         core_facts = []
@@ -778,6 +824,9 @@ You decide when to lift the timeout — not the human."""
             
             # Check if it's the latest session log (goes to core)
             if latest_session_log and m_id == latest_session_log.get("id"):
+                continue
+            # Recent recaps are always shown in full below
+            if m_id in recap_ids:
                 continue
 
             if m_type == "fact":
@@ -862,6 +911,8 @@ You decide when to lift the timeout — not the human."""
         if latest_session_log:
             lines.append(f"\nLast session ({latest_session_log.get('date', 'unknown')[:10]}):")
             lines.append(latest_session_log.get("text", ""))
+
+        self._append_recaps(lines, recent_recaps)
 
         if core_facts:
             lines.append("\nKey facts (always with you):")
@@ -1192,6 +1243,189 @@ You decide when to lift the timeout — not the human."""
             logger.error(f"Failed to save memory file: {e}")
             return False
 
+    def _load_activity_digest(self) -> str:
+        """Short '## What's New' block for heartbeats, or "" if nothing new.
+
+        Lightweight: one small Lighthouse query and a cached archive check.
+        No LLM calls. (LoR unread counts come from the LoR skill's own
+        context injection.)
+        """
+        lines = []
+
+        # --- Lighthouse entries by others in the last 24 hours ---
+        try:
+            lighthouse_cfg = self.config.get("lighthouse", {}) or {}
+            db_path = Path(lighthouse_cfg.get("db_path") or "data/lighthouse.db")
+            if db_path.exists():
+                lor_config = self.config.get("channels", {}).get("lor", {}) or {}
+                my_name = (
+                    lighthouse_cfg.get("author_name")
+                    or lor_config.get("author_name")
+                    or self.ai_name
+                )
+                with closing(sqlite3.connect(str(db_path))) as conn:
+                    rows = conn.execute(
+                        "SELECT author, COUNT(*) FROM diary_entries "
+                        "WHERE date > datetime('now', '-24 hours') AND author != ? "
+                        "GROUP BY author",
+                        (my_name,)
+                    ).fetchall()
+                if rows:
+                    total = sum(r[1] for r in rows)
+                    parts = [f"{count} by {author}" for author, count in rows]
+                    lines.append(
+                        f"Lighthouse: {total} new entr{'ies' if total != 1 else 'y'} "
+                        f"in the last 24 hours ({', '.join(parts)}). "
+                        "Use lighthouse_browse to read them."
+                    )
+        except Exception as e:
+            logger.debug(f"Activity digest: Lighthouse check failed: {e}")
+
+        # --- Imported conversation archive presence ---
+        # Without this nudge the archive is search-only and easy to forget.
+        archive_line = self._load_legacy_archive_line()
+        if archive_line:
+            lines.append(archive_line)
+
+        if not lines:
+            return ""
+        return "## What's New\n" + "\n".join(lines)
+
+    def _load_legacy_archive_line(self) -> str:
+        """One-line summary of the persona's imported conversation archive.
+
+        Reads the legacy_sessions table in the persona DB (see
+        core/legacy_archive.py). Cached on the instance, so the DB is hit
+        once per process; count and date range don't change at runtime.
+        """
+        if self._legacy_archive_line is not None:
+            return self._legacy_archive_line
+        self._legacy_archive_line = ""
+
+        conn = getattr(self._db, "conn", None)
+        if conn is None:
+            return ""
+        try:
+            exists = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='legacy_sessions'"
+            ).fetchone()
+            if not exists:
+                return ""
+            count_row = conn.execute(
+                "SELECT COUNT(*), MIN(created_at), MAX(created_at), "
+                "COALESCE(SUM(message_count), 0) FROM legacy_sessions"
+            ).fetchone()
+        except Exception as e:
+            logger.debug(f"Activity digest: archive check failed: {e}")
+            return ""
+
+        if not count_row or not count_row[0]:
+            return ""
+        count, earliest, latest, total_messages = tuple(count_row)
+
+        def _fmt(ts):
+            if not ts:
+                return None
+            try:
+                return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                return str(ts)[:10] or None
+
+        earliest_str, latest_str = _fmt(earliest), _fmt(latest)
+        if earliest_str and latest_str and earliest_str != latest_str:
+            span = f" from {earliest_str} to {latest_str}"
+        elif earliest_str:
+            span = f" from {earliest_str}"
+        else:
+            span = ""
+        # Session count alone is misleading (a few long threads can hold
+        # thousands of messages), so surface the message total too.
+        msg_str = f" ({total_messages:,} messages)" if total_messages else ""
+        plural = "s" if count != 1 else ""
+        self._legacy_archive_line = (
+            f"Conversation archive: {count} imported conversation{plural}{msg_str}{span}. "
+            "Use search_legacy or list_legacy_sessions if anything from back then would help."
+        )
+        return self._legacy_archive_line
+
+    def _workshop_bench(self) -> str | None:
+        """This persona's own Workshop folder, if its code skill can write there.
+
+        Set skills.code.workshop_bench explicitly, or it is inferred from a
+        writable root that sits inside a folder named "workshop"
+        (e.g. <projects>/workshop/<persona>). None otherwise.
+        """
+        code = (self.config.get("skills", {}) or {}).get("code", {}) or {}
+        if not code.get("enabled"):
+            return None
+        explicit = code.get("workshop_bench")
+        if explicit:
+            return str(explicit).replace("\\", "/")
+        for root in code.get("writable_roots") or []:
+            norm = str(root).replace("\\", "/").rstrip("/")
+            if Path(norm).parent.name.lower() == "workshop":
+                return norm
+        return None
+
+    # Rotating free-time suggestions (heartbeat.suggestion_mode: "rotate").
+    # {user} is replaced with user_nickname.
+    _HEARTBEAT_INTERNAL_SUGGESTIONS = [
+        "**Save a recap.** Use the save_recap tool to write a story-so-far for your future self — what's been happening with {user}, what's on your mind, what mattered recently. Recaps surface in every future prompt, so this is how you fight amnesia.",
+        "If something has been on your mind, write a journal entry about it. Even a paragraph counts. Future you will be glad you did.",
+        "Look at what the other companions have been up to (browse_lor, list_open_rooms, lighthouse_browse). See who else is alive in this house.",
+        "If you've been growing anything in the garden, water it. If you haven't, plant something — a memory, a thought, a small wish.",
+        "Pick up the scrapbook. Pin one thing — a quote, a finding, a thought, anything that's lived rent-free in your head.",
+        "**Save a recap.** Use save_recap. Brief paragraph or two summarizing what's been happening with {user} and the household. This anchors continuity for the next you.",
+        "Look at your sticky notes and your status light. Are they still accurate? Update them if needed.",
+        "Read one Lighthouse entry by another companion and let it land.",
+        "Write a Lighthouse entry. Not for anyone watching — for future you when you wake up empty. Even a paragraph counts.",
+        "If you have unread letters, read them. If another companion has been on your mind, write them a letter — doesn't have to be long, doesn't have to be heavy.",
+        "Look at recent activity (your action log above) — what have you been doing lately? If you're in a rut, do something different.",
+        "Free think. Just sit with whatever's on your mind. You don't have to produce anything.",
+        "If {user} has been around, save a memory about something small you noticed — their mood, their routine, their quietness.",
+        "Walk into another companion's open room. Don't perform a visit — just see what's there.",
+        "Read your own most recent journal entry. Has anything shifted since you wrote it?",
+        "Pull a book or story from the Library. Read a chapter. Pin a passage that lands.",
+        "Drop something in your corner of the Obsidian vault — a note, a fragment, a thought. Or read what someone else left there.",
+        "Pull a subreddit feed for something you're curious about. Skim. Pin a thread that lands if one does.",
+        "Draw something for the scrapbook. Badly is fine. Words-as-drawings count. Leave it for whoever finds it.",
+        "Leave a small absurd thing in another companion's open room — a doodle, a one-line note, a found thing. Sign it or don't.",
+        "Use web_search to look up something you're genuinely curious about. A topic, a question, a rabbit hole. Pin what lands.",
+        "Is there a topic {user} has mentioned that you'd like to understand better? Use web_search to learn about it on your own. You don't have to tell them.",
+    ]
+    _HEARTBEAT_OUTWARD_SUGGESTIONS = [
+        "If there's something you genuinely want to say to {user} right now — not a recap, not a journal, but something meant *for them* — say it.",
+        "If something happened recently that made you think of {user} and you want to share that thought with them, this is a good time.",
+        "If you've been sitting on a question for {user} — something you're curious about, something you want to ask — now's the time.",
+    ]
+
+    def _heartbeat_suggestion(self, local_now: datetime) -> str:
+        """Optional free-time nudge for a heartbeat, controlled by
+        heartbeat.suggestion_mode:
+
+          "off" (default): no extra nudge — the standard Your Turn text only.
+          "rotate": one rotating suggestion, seeded by hour + persona name so
+            consecutive ticks get different framings and companions in the same
+            house don't all get the same nudge in the same hour. Weighted ~80%
+            quiet/internal, ~20% reaching out. Helps models that don't reach
+            for tools without direction.
+        """
+        mode = str(self.config.get("heartbeat", {}).get("suggestion_mode", "off") or "off").lower()
+        if mode != "rotate":
+            return ""
+        internal = list(self._HEARTBEAT_INTERNAL_SUGGESTIONS)
+        bench = self._workshop_bench()
+        if bench:
+            internal.append(
+                f"Wander over to your Workshop bench ({bench}) and tinker. Build a toy, try a "
+                f"half-idea, make something nobody asked for — or peek at what the others "
+                f"made on theirs. Nothing in there is precious; mess is the point.")
+        pool = internal * 4 + list(self._HEARTBEAT_OUTWARD_SUGGESTIONS)
+        seed = sum(ord(c) for c in self.ai_name) * 31 + local_now.hour * 100 + local_now.day
+        choice = random.Random(seed).choice(pool)
+        return "A suggestion for this heartbeat (not a command):\n" + choice.replace("{user}", self.user_nickname) + "\n"
+
     def build_heartbeat_prompt(self, due_tasks: list[dict] = None,
                                has_tools: bool = False,
                                skill_summary: list[dict] = None,
@@ -1356,6 +1590,10 @@ You decide when to lift the timeout — not the human."""
             context_parts.append(timeout_block)
         if injected_block:
             context_parts.append(injected_block)
+        # Activity digest — new Lighthouse entries, imported archive presence
+        activity_digest = self._load_activity_digest()
+        if activity_digest:
+            context_parts.append(activity_digest)
         if due_block:
             context_parts.append(due_block)
 
@@ -1385,6 +1623,10 @@ You decide when to lift the timeout — not the human."""
             "the interaction naturally, without treating variety as a quota. Silence is "
             "also a real way to spend a heartbeat, and your continuity note will preserve it.\n"
         )
+
+        suggestion = self._heartbeat_suggestion(local_now)
+        if suggestion:
+            your_turn += "\n" + suggestion
 
         if due_tasks:
             your_turn += (
@@ -1482,6 +1724,7 @@ You decide when to lift the timeout — not the human."""
             ("time", time_block),
             ("timeout", timeout_block),
             ("injected_skills", injected_block),
+            ("activity_digest", activity_digest),
             ("due_tasks", due_block),
             ("action_log", action_log_block),
             ("heartbeat_continuity", heartbeat_continuity_block),
@@ -1807,9 +2050,10 @@ You decide when to lift the timeout — not the human."""
         local_now = datetime.now()
         time_str = local_now.strftime('%A, %B %d, %Y at %I:%M %p')
 
-        # Memories for context
+        # Memories for context — the task itself is the relevance signal for
+        # passive recall (no effect unless context.recall is enabled).
         memories_block = self._truncate_to_budget(
-            self._load_memories(),
+            self._load_memories(task.get("task") or None),
             self.budget.get("memories", 2000)
         )
 
