@@ -70,6 +70,28 @@ class PulseDatabase:
             "ON memories(status, date DESC)"
         )
         self.conn.commit()
+        self._migrate()
+
+    def _migrate(self):
+        """Run incremental schema migrations for columns added after initial release."""
+        # Migration 1: legacy_session_id on memories, for legacy summaries
+        # backfilled into the memory pool (see backfill_legacy_memories).
+        # The `source` column itself is added in _init_tables.
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(memories)").fetchall()}
+        if "legacy_session_id" not in cols:
+            self.conn.execute("ALTER TABLE memories ADD COLUMN legacy_session_id TEXT")
+            self.conn.commit()
+            logger.info("Migration: added legacy_session_id column to memories")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_source ON memories(source, date DESC)")
+        self.conn.commit()
+
+        # Migration 2: variant column on pets, so one species can have
+        # several sub-flavors. Nullable: older pets stay on the species default.
+        pcols = {r["name"] for r in self.conn.execute("PRAGMA table_info(pets)").fetchall()}
+        if "variant" not in pcols:
+            self.conn.execute("ALTER TABLE pets ADD COLUMN variant TEXT")
+            self.conn.commit()
+            logger.info("Migration: added variant column to pets")
 
     def close(self):
         """Close the database connection."""
@@ -458,6 +480,105 @@ class PulseDatabase:
         cur = self.conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
         self.conn.commit()
         return cur.rowcount > 0
+
+    def has_legacy_memories(self) -> bool:
+        """Check if any legacy memories have been backfilled."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE source = 'legacy'"
+        ).fetchone()
+        return row[0] > 0
+
+    def backfill_legacy_memories(self, legacy_db_path: str) -> int:
+        """Import legacy_summaries from a legacy.db into the unified memories table.
+
+        Each legacy summary becomes a memory with source='legacy' and
+        type='legacy_context'. Deduplicates by session — keeps the best
+        (longest) summary per session. Idempotent: skips if legacy
+        memories already exist.
+
+        Returns the number of memories imported.
+        """
+        if self.has_legacy_memories():
+            logger.info("Legacy memories already backfilled, skipping")
+            return 0
+
+        legacy_path = Path(legacy_db_path)
+        if not legacy_path.exists():
+            logger.warning(f"Legacy DB not found: {legacy_path}")
+            return 0
+
+        try:
+            legacy_conn = sqlite3.connect(str(legacy_path), check_same_thread=False)
+            legacy_conn.row_factory = sqlite3.Row
+        except Exception as e:
+            logger.warning(f"Could not open legacy DB for backfill: {e}")
+            return 0
+
+        try:
+            # Check if legacy_summaries table exists
+            has_summaries = False
+            try:
+                count = legacy_conn.execute("SELECT COUNT(*) FROM legacy_summaries").fetchone()[0]
+                has_summaries = count > 0
+            except Exception:
+                pass
+
+            if not has_summaries:
+                logger.info("No legacy_summaries table or no data — skipping backfill")
+                return 0
+
+            # Load all summaries with session metadata
+            rows = legacy_conn.execute("""
+                SELECT ls.summary_text, ls.summary_embedding, ls.session_id, ls.chunk_index,
+                       s.title, s.created_at
+                FROM legacy_summaries ls
+                JOIN legacy_sessions s ON s.id = ls.session_id
+                ORDER BY s.created_at ASC, ls.chunk_index ASC
+            """).fetchall()
+
+            if not rows:
+                return 0
+
+            # Deduplicate: keep the longest summary per session
+            best_per_session: dict[str, dict] = {}
+            for row in rows:
+                sid = row["session_id"]
+                text = row["summary_text"] or ""
+                existing = best_per_session.get(sid)
+                if not existing or len(text) > len(existing["text"]):
+                    best_per_session[sid] = {
+                        "text": text,
+                        "embedding": row["summary_embedding"],
+                        "session_id": sid,
+                        "title": row["title"] or "(untitled)",
+                        "created_at": row["created_at"],
+                    }
+
+            # Insert into memories table
+            imported = 0
+            for entry in best_per_session.values():
+                # Build a readable memory text with the session title for context
+                title = entry["title"]
+                text = entry["text"]
+                memory_text = f"[Archive: {title}] {text}" if title != "(untitled)" else text
+
+                tags_json = json.dumps(["legacy", "archive"])
+                self.conn.execute(
+                    "INSERT INTO memories (text, tags, type, importance, embedding, "
+                    "date, source, legacy_session_id) "
+                    "VALUES (?, ?, 'legacy_context', 3, ?, ?, 'legacy', ?)",
+                    (memory_text, tags_json, entry["embedding"],
+                     entry["created_at"] or datetime.now().isoformat(),
+                     entry["session_id"])
+                )
+                imported += 1
+
+            self.conn.commit()
+            logger.info(f"Backfilled {imported} legacy memories from {legacy_path}")
+            return imported
+
+        finally:
+            legacy_conn.close()
 
     def save_memory_chunks(self, memory_id: int, chunk_blobs: list[bytes]) -> None:
         """Insert or replace memory chunks."""
@@ -982,6 +1103,49 @@ class PulseDatabase:
         )
         self.conn.commit()
 
+    # ── Pets ─────────────────────────────────────────────────
+
+    def save_pet(self, name: Optional[str], species: str, state: str = "{}",
+                 variant: Optional[str] = None) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO pets (name, species, variant, state) VALUES (?, ?, ?, ?)",
+            (name, species, variant, state)
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_pet(self, pet_id: int) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM pets WHERE id = ?", (pet_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_all_pets(self) -> list[dict]:
+        rows = self.conn.execute("SELECT * FROM pets").fetchall()
+        return [dict(r) for r in rows]
+
+    def update_pet(self, pet_id: int, **kwargs) -> bool:
+        if not kwargs:
+            return False
+        fields = []
+        params = []
+        for k, v in kwargs.items():
+            if k == "last_tended" and v == "datetime('now')":
+                fields.append(f"{k} = datetime('now')")
+            else:
+                fields.append(f"{k} = ?")
+                params.append(v)
+        params.append(pet_id)
+        sql = f"UPDATE pets SET {', '.join(fields)} WHERE id = ?"
+        cur = self.conn.execute(sql, params)
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def delete_pet(self, pet_id: int) -> bool:
+        cur = self.conn.execute("DELETE FROM pets WHERE id = ?", (pet_id,))
+        self.conn.commit()
+        return cur.rowcount > 0
+
     # ── Utility ──────────────────────────────────────────────
 
     def row_count(self, table: str) -> int:
@@ -991,7 +1155,7 @@ class PulseDatabase:
             "messages", "sessions", "memories", "schedules", "tasks",
             "dev_journal", "action_log", "heartbeat_episodes", "usage",
             "journal_entries", "identity",
-            "garden_plants", "timeouts", "lor_read_state"
+            "garden_plants", "timeouts", "lor_read_state", "pets"
         }
         if table not in valid:
             raise ValueError(f"Unknown table: {table}")
@@ -1198,5 +1362,17 @@ CREATE TABLE IF NOT EXISTS memory_chunks (
     chunk_index INTEGER NOT NULL,
     embedding BLOB NOT NULL,
     UNIQUE(memory_id, chunk_index)
+);
+
+-- Pets
+CREATE TABLE IF NOT EXISTS pets (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT,
+    species      TEXT NOT NULL,
+    variant      TEXT,                                      -- optional subspecies (NULL = species default)
+    state        TEXT NOT NULL DEFAULT '{}',
+    growth       REAL NOT NULL DEFAULT 0.0,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    last_tended  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """

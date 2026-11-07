@@ -1,0 +1,28 @@
+# Persona registry for the Pulse Chat TUI (tui/app.py).
+#
+# Copy this file to tui/personas.yaml (gitignored) and fill it in.
+# Each entry maps a persona to:
+#   - id           : a short key (usually the persona's folder name)
+#   - display_name : what shows in the UI and chat history
+#   - bot_username : the persona's Telegram bot handle (no @)
+#   - log_file     : which file in logs/ to show in the activity pane
+#                    (matches the persona's folder name in personas/)
+#   - hotkey       : the F-key number that switches to them (1-9 -> F1-F9)
+#   - accent       : optional color for their name (#rrggbb)
+#
+# To skip one: leave bot_username empty and it's hidden from the picker.
+
+personas:
+  - id: ada
+    display_name: Ada
+    bot_username: ""            # e.g. my_ada_bot
+    log_file: ada
+    hotkey: "1"
+    accent: "#c8a8ff"
+
+  - id: basil
+    display_name: Basil
+    bot_username: ""
+    log_file: basil
+    hotkey: "2"
+    accent: "#a8e890"

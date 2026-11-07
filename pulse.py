@@ -447,6 +447,19 @@ async def main(config_path: str, persona_name: str | None = None, local_anyway: 
                 "  pip install python-telegram-bot"
             )
 
+    # Ask API — authenticated HTTP door for Siri/Shortcuts (off by default;
+    # requires ASK_API_TOKEN in the persona's .env). See channels/ask_api.py.
+    ask_api_channel = None
+    if channel_config.get("ask_api", {}).get("enabled", False):
+        try:
+            from channels.ask_api import AskApiChannel
+            ask_api_channel = AskApiChannel(config)
+            await ask_api_channel.initialize()
+            channels["ask_api"] = ask_api_channel
+        except Exception as e:
+            logger.error(f"ask_api channel failed to start: {e}")
+            ask_api_channel = None
+
     logger.info(f"Active channels: {', '.join(channels.keys()) or 'none'}")
 
     # Initialize skill registry (tool-calling for conversations)
@@ -478,6 +491,10 @@ async def main(config_path: str, persona_name: str | None = None, local_anyway: 
     # Connect Telegram to engine for bidirectional messaging
     if telegram_channel:
         telegram_channel.set_engine(engine)
+
+    # Connect the Ask API to the engine (same bidirectional pipeline)
+    if ask_api_channel:
+        ask_api_channel.set_engine(engine)
 
     # Handle graceful shutdown
     def signal_handler(sig, frame):

@@ -11,6 +11,7 @@ This is the main orchestrator. It:
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -25,9 +26,32 @@ except ImportError:
 from core.llm_openai import OpenAIResponsesClient
 from core.context import ContextManager
 from core.scheduler import ScheduleManager
+from core.recap_task import RecapTask
 from core.archive_enrichment import run_one_idle_enrichment
 
 logger = logging.getLogger(__name__)
+
+
+# System prompt for the image captioner. Kept short and directive because the
+# caption REPLACES the image in the persona's long-term memory of the
+# conversation — so future re-reads must be able to reconstruct what was
+# shared from the caption alone.
+CAPTION_SYSTEM_PROMPT = (
+    "You are producing a text description of an image that a human just shared "
+    "in a conversation with an AI companion. Your caption will REPLACE the "
+    "image in the companion's memory after this turn, so the caption alone "
+    "must let a future reader reconstruct what was shared.\n\n"
+    "Include (as applicable):\n"
+    "- Image type (screenshot, photo, drawing, meme, diagram, etc.)\n"
+    "- Any visible text, verbatim if short, summarized if long\n"
+    "- What is happening visually\n"
+    "- If it is a screenshot of a conversation: who is speaking, what they "
+    "said, any tone signals\n"
+    "- Emotional / tonal signals worth preserving\n\n"
+    "Be factual and direct. No preamble like \"This image shows...\" — "
+    "describe directly. Aim for 100-250 words; shorter for simple images, "
+    "longer for dense screenshots. Do not editorialize or add commentary."
+)
 
 
 class PulseEngine:
@@ -120,11 +144,106 @@ class PulseEngine:
                 reasoning=model_config.get("reasoning", False),
                 reasoning_effort=model_config.get("reasoning_effort", ""),
                 provider_type=provider_type,
+                provider_routing=provider_config.get("routing"),
             )
         self.llm._provider_name = provider_type
 
+        # Optional summarizer LLM — for context-compression calls only.
+        # When provider.summarization_model is set on an Anthropic persona, this
+        # is a lightweight second client on a cheaper model (e.g. Haiku 4.5). The
+        # compression prompt is mechanical ("You are a summarizer") — not identity-
+        # bearing — so routing this to a cheaper model saves cost without
+        # changing who the persona is. Recap generation and every other LLM call
+        # stays on self.llm. A byline is added inside _summarize_conversation so
+        # future readers of the summary know which model wrote it.
+        summarizer_model = provider_config.get("summarization_model", "")
+        if summarizer_model and provider_type == "anthropic":
+            self.summarizer_llm = AnthropicClient(
+                endpoint=endpoint,
+                model_name=summarizer_model,
+                temperature=model_config.get("temperature", 0.7),
+                max_tokens=model_config.get("max_response_tokens", 1024),
+                top_p=model_config.get("top_p", 1.0),
+                api_key=api_key,
+                usage_tracker=usage_tracker,
+                cache_ttl="5m",             # summaries aren't re-read, no cache benefit
+                cache_automatic=False,
+            )
+            self.summarizer_llm._provider_name = provider_type
+            logger.info(f"Summarizer LLM: routing _summarize_conversation to {summarizer_model} (persona stays on {model_name})")
+        else:
+            self.summarizer_llm = self.llm
+
+        # Optional captioner LLM — for image-captioning at ingest.
+        # When provider.captioning_model is set, incoming images get a one-time
+        # text description that persists in conversation history. Without this,
+        # images are dropped to "[sent an image]" after the immediate turn and
+        # the persona has no memory of what was shared. A small vision model
+        # (e.g. Haiku 4.5) costs very little next to the main model.
+        captioner_model = provider_config.get("captioning_model", "")
+        if captioner_model and provider_type == "anthropic":
+            self.captioner_llm = AnthropicClient(
+                endpoint=endpoint,
+                model_name=captioner_model,
+                temperature=0.3,          # low temp for consistent factual captions
+                max_tokens=500,           # caps caption length — ~300-400 tokens typical
+                top_p=1.0,
+                api_key=api_key,
+                usage_tracker=usage_tracker,
+                cache_ttl="5m",           # captions aren't re-read; caching irrelevant
+                cache_automatic=False,
+            )
+            self.captioner_llm._provider_name = provider_type
+            logger.info(f"Captioner LLM: routing image-caption-at-ingest to {captioner_model} (persona stays on {model_name})")
+        elif captioner_model:
+            # Captioner for NON-Anthropic personas too —
+            # any OpenAI-compatible vision model. Defaults to the persona's own
+            # provider/endpoint/key; or set provider.captioning_provider:
+            # "openrouter" to route captions through OpenRouter (key from
+            # OPENROUTER_API_KEY, or provider.captioning_api_key_env).
+            cap_provider = provider_config.get("captioning_provider", provider_type)
+            cap_endpoint, cap_key = endpoint, api_key
+            if cap_provider != provider_type or provider_config.get("captioning_endpoint"):
+                cap_endpoint = provider_config.get("captioning_endpoint") or (
+                    "https://openrouter.ai/api/v1" if cap_provider == "openrouter" else endpoint)
+                key_env = provider_config.get("captioning_api_key_env") or (
+                    "OPENROUTER_API_KEY" if cap_provider == "openrouter" else "")
+                cap_key = os.environ.get(key_env, "") if key_env else api_key
+            if cap_provider == "anthropic":
+                logger.warning("captioning_provider 'anthropic' only works on Anthropic personas — captioner off")
+                self.captioner_llm = None
+            else:
+                self.captioner_llm = LLMClient(
+                    endpoint=cap_endpoint,
+                    model_name=captioner_model,
+                    temperature=0.3,
+                    max_tokens=500,
+                    api_key=cap_key,
+                    usage_tracker=usage_tracker,
+                    provider_type=cap_provider,
+                )
+                self.captioner_llm._provider_name = cap_provider
+                logger.info(f"Captioner LLM ({cap_provider}): routing image-caption-at-ingest to "
+                            f"{captioner_model} (persona stays on {model_name})")
+        else:
+            self.captioner_llm = None
+
+        # provider.vision: false — for models that can't
+        # see (GLM, DeepSeek, ...). Incoming images are captioned FIRST and the
+        # description is sent instead of the picture, so a blind model still
+        # knows what was shared. Needs a captioning_model to be useful.
+        self.vision = provider_config.get("vision", True)
+        if not self.vision:
+            logger.info("Vision off for this model — images will be described to it via the captioner")
+
         self.max_tool_rounds = model_config.get("max_tool_rounds", 5)
         self.default_tool_loop_mode = model_config.get("tool_loop_mode", "capped")
+        # Some models (e.g. reasoning-only OpenRouter routes) reject the tools
+        # param entirely — offering it 404s. provider.supports_tools: false
+        # makes this persona run in plain-chat mode (no tool calls).
+        self.tools_enabled = provider_config.get("supports_tools", True)
+        if not self.tools_enabled:
+            logger.info("Tools disabled (provider.supports_tools=false) — plain-chat mode")
         self.context = ContextManager(config)
         self.scheduler = ScheduleManager(config)
 
@@ -167,6 +286,33 @@ class PulseEngine:
         self.dev_tick_schedule = dev_config.get("schedule_time", "")  # e.g. "20:00"
         self._pulse_root = str(Path(config.get("_pulse_root", ".")).resolve())
 
+        # Auto-recap — silently writes a story-so-far summary after sessions wrap.
+        # Safety net for when the AI doesn't proactively call save_recap.
+        recap_config = config.get("auto_recap", {})
+        self.auto_recap_enabled = recap_config.get("enabled", True)
+        self.recap_task = RecapTask(
+            self,
+            inactivity_minutes=recap_config.get("inactivity_minutes", 120),
+            cooldown_hours=recap_config.get("cooldown_hours", 4),
+            min_messages=recap_config.get("min_messages", 4),
+        )
+
+        # Backfill summaries from a standalone legacy archive (paths.legacy_db)
+        # into the memory pool as source='legacy' memories, so passive recall
+        # can surface them. Idempotent — skips when already imported.
+        legacy_db_path = str(config.get("paths", {}).get("legacy_db") or "").strip()
+        backfill_db = config.get("_shared_db") or self.db
+        if legacy_db_path and backfill_db and hasattr(backfill_db, "backfill_legacy_memories"):
+            legacy_path = Path(legacy_db_path)
+            if not legacy_path.is_absolute():
+                legacy_path = Path(self._pulse_root) / legacy_path
+            try:
+                imported = backfill_db.backfill_legacy_memories(str(legacy_path))
+                if imported:
+                    logger.info(f"Legacy backfill: imported {imported} memories")
+            except Exception as e:
+                logger.warning(f"Legacy backfill failed (non-fatal): {e}")
+
         self._running = False
         self._stop_event = asyncio.Event()
 
@@ -194,6 +340,12 @@ class PulseEngine:
             config.get("paths", {}).get("action_log", "data/action_log.json")
         )
         self._action_log_max = 20  # keep last 20 actions
+
+    def _available_tools(self) -> list:
+        """Full tool list for scheduled tasks, or [] when the model can't do tool calls."""
+        if not self.tools_enabled or not self.skill_registry:
+            return []
+        return self.skill_registry.get_all_tools()
 
     def _resolve_tool_loop_params(self) -> tuple[str, int]:
         """Resolve tool loop mode and budget based on skills in play.
@@ -341,6 +493,9 @@ class PulseEngine:
     def _log_action(self, action: str, tools_used: list[str] = None, summary: str = ""):
         """Append an entry to the heartbeat action log (ring buffer)."""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        # Coerce None → "" so the DB's NOT NULL on summary doesn't fail when
+        # callers pass response.message (which is None for silent actions).
+        summary = summary or ""
 
         if self.db:
             try:
@@ -815,9 +970,60 @@ class PulseEngine:
 
         return tg_msg_id
 
+    async def _caption_image(self, image_url: str) -> str:
+        """Generate a text description of one image via the captioner LLM.
+
+        Returns empty string on failure or if captioning is disabled. Callers
+        must treat empty as "no caption available" and fall back to the plain
+        marker. Runs the sync chat call in a thread so we don't block the
+        event loop.
+        """
+        if not self.captioner_llm:
+            return ""
+        prompt = [
+            {"role": "system", "content": CAPTION_SYSTEM_PROMPT},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Describe this image for future memory."},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ]},
+        ]
+        try:
+            # One-shot utility call: use the uncached path where the client
+            # has one (Anthropic), plain chat() otherwise.
+            caption_chat = getattr(self.captioner_llm, "chat_uncached", self.captioner_llm.chat)
+            response = await asyncio.to_thread(caption_chat, prompt)
+            if response and response.raw:
+                return response.raw.strip()
+        except Exception as e:
+            logger.warning(f"Image caption failed: {e}")
+        return ""
+
+    async def _caption_images(self, image_urls: list[str]) -> list[str]:
+        """Caption a batch of images in parallel. Returns a list aligned with
+        image_urls; entries are empty strings on individual failures."""
+        if not image_urls or not self.captioner_llm:
+            return []
+        return await asyncio.gather(*[self._caption_image(u) for u in image_urls])
+
+    @staticmethod
+    def _image_history_note(image_urls: list[str], captions: list[str]) -> str:
+        """Text that stands in for the images in persisted conversation history."""
+        if not image_urls:
+            return ""
+        if not any(captions):
+            # Captioning disabled or every attempt failed — plain marker fallback
+            if len(image_urls) == 1:
+                return " [sent an image]"
+            return f" [sent {len(image_urls)} images]"
+        if len(image_urls) == 1:
+            return f" [image sent: {captions[0]}]"
+        parts = [f"  {i}. {cap or '(caption failed)'}" for i, cap in enumerate(captions, 1)]
+        return f" [sent {len(image_urls)} images:\n" + "\n".join(parts) + "\n]"
+
     async def handle_message(self, message: str, source: str = "telegram",
                             image_url: str = None,
-                            channel_message_id: int = None) -> tuple[str, list[str], str, list[int]]:
+                            channel_message_id: int = None,
+                            image_urls: list[str] | None = None) -> tuple[str, list[str], str, list[int]]:
         """Handle an incoming message and return the companion's response.
 
         This is for bidirectional chat (Telegram, future voice, etc.).
@@ -829,10 +1035,15 @@ class PulseEngine:
         Args:
             message: The user's message text
             source: Where the message came from ("telegram", "voice", etc.)
-            image_url: Optional base64 data URI for an image (vision models)
+            image_url: Optional base64 data URI for one image (vision models)
+            channel_message_id: Optional channel-side id of the incoming message
+            image_urls: Optional list of base64 data URIs — several images
+                (e.g. a Telegram album) attached to one turn. Used instead of
+                image_url when given.
 
         Returns:
-            Tuple of (companion's response text, list of tools used, reasoning).
+            Tuple of (companion's response text, list of tools used, reasoning,
+            new conversation-history DB ids).
             `reasoning` is the captured chain of thought if the model exposed
             any (via reasoning_content / reasoning fields / <think> tags),
             otherwise an empty string. The channel decides whether to display
@@ -862,20 +1073,42 @@ class PulseEngine:
         # Load conversation history
         history = self.context._load_conversation()
 
-        # Build conversation prompt (with optional image)
-        skill_summary = self.skill_registry.get_skill_summary() if self.skill_registry else []
-        on_demand_manifest = self.skill_registry.get_on_demand_manifest() if self.skill_registry else []
+        # One image (image_url) or several (image_urls, e.g. a Telegram album)
+        image_urls = [u for u in (image_urls or []) if u]
+        if image_url and not image_urls:
+            image_urls = [image_url]
+
+        # Blind model (provider.vision: false): describe the images first and
+        # send the descriptions instead of the pictures.
+        pre_captions: list[str] = []
+        model_images = image_urls or None
+        model_message = message          # what the model sees this turn (history keeps `message`)
+        if image_urls and not self.vision:
+            pre_captions = await self._caption_images(image_urls)
+            notes = []
+            for i, cap in enumerate(pre_captions or [""] * len(image_urls), 1):
+                label = "image" if len(image_urls) == 1 else f"image {i}"
+                notes.append(f"[{label}: {cap}]" if cap else
+                             f"[{label} sent — you can't see images, and it couldn't be described this time]")
+            model_message = (message + "\n" if message else "") + "\n".join(notes)
+            model_images = None
+
+        # Build conversation prompt (with optional images)
+        tools_on = bool(self.skill_registry) and self.tools_enabled
+        skill_summary = self.skill_registry.get_skill_summary() if tools_on else []
+        on_demand_manifest = self.skill_registry.get_on_demand_manifest() if tools_on else []
         messages = self.context.build_conversation_prompt(
-            message, history, image_url=image_url, timeout_state=timeout_state,
+            model_message, history, image_urls=model_images, timeout_state=timeout_state,
             skill_summary=skill_summary, on_demand_manifest=on_demand_manifest
         )
-        logger.info(f"Sending {len(messages)} messages to LLM for {source} reply"
-                     f"{' (with image)' if image_url else ''}...")
+        n_images = len(image_urls)
+        image_tag = "" if not n_images else (" (with image)" if n_images == 1 else f" (with {n_images} images)")
+        logger.info(f"Sending {len(messages)} messages to LLM for {source} reply{image_tag}...")
 
         # Get response — run in thread so we don't block the event loop!
         # If skills are available, use tool-calling mode; otherwise plain chat.
         tools_used = []
-        tools = self.skill_registry.get_always_tools() if self.skill_registry else []
+        tools = self.skill_registry.get_always_tools() if tools_on else []
         t0 = time.time()
         if tools:
             logger.info(f"Tool-calling mode: {len(tools)} tools available")
@@ -890,6 +1123,12 @@ class PulseEngine:
             reply = response.raw.strip() if response and response.raw else None
         elapsed = time.time() - t0
         logger.info(f"LLM {source} reply took {elapsed:.1f}s (tools: {', '.join(tools_used) if tools_used else 'none'})")
+
+        # Record conversation tool use in the action log. Heartbeats have
+        # always logged theirs; without this, tools used only in conversation
+        # look unused in any usage audit. Same table, action="conversation".
+        if tools_used:
+            self._log_action("conversation", tools_used, f"{source}: {message[:80]}")
 
         # Capture the model's reasoning if it exposed any. The LLM client
         # populates `last_reasoning` from <think> tags / reasoning_content
@@ -938,18 +1177,33 @@ class PulseEngine:
         else:
             history_reply = reply or skill_text
 
+        # Images themselves are too large to persist as raw data, so they are
+        # dropped from history after this turn. If captioning is enabled, each
+        # image is captioned first so its content survives as text; without
+        # that the persona only ever sees "[sent an image]" later. Captioning
+        # runs AFTER the reply so it never adds to the perceived response time.
+        captions: list[str] = list(pre_captions)
+        if image_urls and self.captioner_llm and not captions:
+            t_cap = time.time()
+            captions = await self._caption_images(image_urls)
+            n_ok = sum(1 for c in captions if c)
+            logger.info(
+                f"Captioned {n_ok}/{len(image_urls)} image(s) in "
+                f"{time.time() - t_cap:.1f}s (captioner: {self.captioner_llm.model_name})"
+            )
+
+        # Timestamps help the companion understand temporal flow
+        timestamp = datetime.now().strftime("[%b %d, %I:%M %p]")
+        image_note = self._image_history_note(image_urls, captions)
+
         # Persist the user's message to history even when there's no reply to
         # store. Otherwise an empty reply (e.g. wake-up housekeeping) silently
         # discards the incoming message, and the companion loses all memory of
         # it — exactly the "I never received your first message" symptom.
-        timestamp = datetime.now().strftime("[%b %d, %I:%M %p]")
-        image_note = " [sent an image]" if image_url else ""
         if not history_reply:
             history.append({"role": "user", "content": f"{timestamp} {message}{image_note}"})
             return None, tools_used, reasoning, self.context.save_conversation(history)
 
-        # Update conversation history (store text only — images are too large to persist)
-        # Timestamps help the companion understand temporal flow
         history.append({"role": "user", "content": f"{timestamp} {message}{image_note}"})
         history.append({"role": "assistant", "content": history_reply})
 
@@ -1043,16 +1297,21 @@ class PulseEngine:
                 f"{conversation_text}"
             )}
         ]
-        # Run in thread — this is also a sync HTTP call
-        # Don't pass tools — this is a utility call, not a conversation
-        # A summary prompt is unique and never reused. Anthropic's ordinary
-        # chat path would otherwise buy a 1h cache entry for the full old
-        # conversation, doubling input cost with no later read.
-        summary_chat = getattr(self.llm, "chat_uncached", self.llm.chat)
+        # Summaries are one-shot: use the uncached path where the client has
+        # one (a cache entry for the whole old conversation is never read
+        # again). provider.summarization_model routes this to a cheaper
+        # model; otherwise summarizer_llm is self.llm.
+        summarizer = self.summarizer_llm
+        summary_chat = getattr(summarizer, "chat_uncached", summarizer.chat)
         response = await asyncio.to_thread(summary_chat, summary_prompt)
         if response and response.raw:
             summary = strip_think_tags(response.raw).strip()
             if summary:
+                # Byline: if a different model wrote the summary, prefix it so future
+                # readers (memory loads, archived conversations, next-instance context)
+                # know that model authored this mechanical compression — NOT the persona.
+                if self.summarizer_llm is not self.llm:
+                    summary = f"[summarized by {self.summarizer_llm.model_name}]\n\n{summary}"
                 logger.info(f"Conversation summarized: {summary[:80]}...")
                 return summary
         return None
@@ -1072,7 +1331,7 @@ class PulseEngine:
             logger.warning("LLM server not available — can't execute due tasks.")
             return False
 
-        tools = self.skill_registry.get_all_tools() if self.skill_registry else []
+        tools = self._available_tools()
 
         for task in due_tasks:
             logger.info(f"Executing due task: {task['task']}")
@@ -1083,6 +1342,9 @@ class PulseEngine:
             if tools:
                 self._log_tool_payload_breakdown("scheduled_task", tools)
                 tool_mode, tool_budget = self._resolve_tool_loop_params()
+                # House-project (Workbench) turns need room to read, write AND hand off
+                if task.get("created_by") == "Workbench":
+                    tool_budget = max(tool_budget, 16)
                 text, tools_used = await asyncio.to_thread(
                     self.llm.chat_with_tools, messages, tools, self.skill_registry,
                     max_rounds=tool_budget, loop_mode=tool_mode, autonomous=True
@@ -1159,7 +1421,7 @@ class PulseEngine:
             return None
 
         # Free-think tick — companion decides what to do
-        if self.skill_registry:
+        if self.skill_registry and self.tools_enabled:
             shelf_names = self.skill_registry.get_heartbeat_shelf_names()
             tools = self.skill_registry.get_heartbeat_tools(shelf_names)
             if shelf_names:
@@ -1257,13 +1519,107 @@ class PulseEngine:
 
         return response
 
-    async def _do_dev_tick(self):
-        """Execute a dev tick — autonomous self-improvement session.
+    def _claim_next_dev_request(self):
+        """Claim the oldest pending dev request from the queue.
 
-        The companion gets agentic tools (read code, search, write skills) and
-        works on a git branch. Changes are validated and committed, then the
-        human is pinged for review. All writes are sandboxed to skills/ and
-        persona.json.
+        Returns (topic, why, claim_ts) or None if no pending requests.
+        Marks the claimed entry as 'claimed' and persists immediately so a
+        crash mid-tick doesn't double-process.
+        """
+        queue_path = Path(self._pulse_root) / "data" / "dev_requests.jsonl"
+        if not queue_path.exists():
+            return None
+
+        try:
+            text = queue_path.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning(f"Failed to read dev request queue: {e}")
+            return None
+
+        entries = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+        pending_idx = None
+        for i, e in enumerate(entries):
+            if e.get("status") == "pending":
+                pending_idx = i
+                break
+
+        if pending_idx is None:
+            return None
+
+        entries[pending_idx]["status"] = "claimed"
+        entries[pending_idx]["claimed_at"] = datetime.now().isoformat(timespec="seconds")
+        self._write_dev_queue(entries)
+
+        topic = entries[pending_idx].get("topic", "")
+        why = entries[pending_idx].get("why", "")
+        claim_ts = entries[pending_idx].get("ts", "")
+        return (topic, why, claim_ts)
+
+    def _finalize_dev_request(self, claim_ts: str, status: str, **extra):
+        """Mark the claimed request as completed or failed."""
+        queue_path = Path(self._pulse_root) / "data" / "dev_requests.jsonl"
+        if not queue_path.exists():
+            return
+
+        try:
+            text = queue_path.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning(f"Failed to finalize dev request: {e}")
+            return
+
+        entries = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+        for e in entries:
+            if e.get("ts") == claim_ts:
+                e["status"] = status
+                for k, v in extra.items():
+                    e[k] = v
+                break
+
+        self._write_dev_queue(entries)
+
+    def _write_dev_queue(self, entries):
+        """Rewrite the dev requests queue file."""
+        queue_path = Path(self._pulse_root) / "data" / "dev_requests.jsonl"
+        try:
+            queue_path.parent.mkdir(parents=True, exist_ok=True)
+            with queue_path.open("w", encoding="utf-8") as f:
+                for e in entries:
+                    f.write(json.dumps(e, ensure_ascii=False) + "\n")
+        except OSError as e:
+            logger.warning(f"Failed to write dev queue: {e}")
+
+    async def _do_dev_tick(self, topic: str = "", why: str = ""):
+        """Execute a dev tick — code session on an isolated git branch.
+
+        Two modes:
+        - Autonomous (topic=""): the companion roams the codebase and picks
+          what to work on. Fires on the periodic dev_tick schedule.
+        - Targeted (topic set): a user-directed request from the dev_request
+          queue; the agentic loop focuses on the topic. Fires whenever
+          there's a pending request, independent of the periodic
+          dev_tick.enabled flag.
+
+        Either way: agentic tools (read code, search, write skills);
+        writes sandboxed to skills/ + persona.json; changes go on a fresh
+        git branch; human gets pinged for review.
         """
         import subprocess
 
@@ -1299,12 +1655,28 @@ class PulseEngine:
                 ["git", "status", "--porcelain", "--", "skills/", "persona.json"],
                 capture_output=True, text=True, cwd=self._pulse_root
             )
-            if status.stdout.strip():
+            # Filter out untracked (??) entries — they don't conflict with
+            # branch ops (the dev tick checks out a branch, commits specific
+            # files, switches back; untracked stuff survives unchanged).
+            # Block only on MODIFIED tracked files in skills/ or persona.json.
+            dirty_tracked = [
+                line for line in status.stdout.splitlines()
+                if line.strip() and not line.startswith("??")
+            ]
+            if dirty_tracked:
                 self._save_dev_tick_to_history(
                     "I tried to run an autonomous dev tick, but skipped because "
                     "there were uncommitted changes in skills/ or persona.json."
                 )
-                logger.warning("Uncommitted changes in skills/ — skipping dev tick to avoid conflicts.")
+                logger.warning("Modified tracked files in skills/ — skipping dev tick to avoid conflicts.")
+                if topic:
+                    telegram = self.channels.get("telegram")
+                    if telegram:
+                        await telegram.send(
+                            f"Couldn't run \"{topic}\" — there are modified "
+                            f"files in skills/ that I'd conflict with. Commit "
+                            f"or stash them, then ask me again."
+                        )
                 return
 
             subprocess.run(
@@ -1333,8 +1705,8 @@ class PulseEngine:
 
             dev_registry = _DevRegistry()
 
-            # Build the dev tick prompt
-            messages = self.context.build_dev_prompt()
+            # Build the dev tick prompt (topic-aware when set)
+            messages = self.context.build_dev_prompt(topic=topic, why=why)
 
             # Run the agentic loop with dev tools only
             logger.info(f"Dev tick: {len(dev_tools)} tools available, max {self.dev_tick_max_rounds} rounds")
@@ -1369,7 +1741,12 @@ class PulseEngine:
                     cwd=self._pulse_root, check=True
                 )
 
-                commit_msg = f"[{persona_slug}-dev] {text[:100] if text else 'Dev tick changes'}"
+                if topic:
+                    commit_msg = f"[{persona_slug}-dev] {topic[:80]}"
+                    if text:
+                        commit_msg += f"\n\n{text[:300]}"
+                else:
+                    commit_msg = f"[{persona_slug}-dev] {text[:100] if text else 'Dev tick changes'}"
                 subprocess.run(
                     ["git", "commit", "-m", commit_msg],
                     capture_output=True, text=True, cwd=self._pulse_root, check=True
@@ -1377,8 +1754,12 @@ class PulseEngine:
                 logger.info(f"Dev tick committed {len(all_changed)} file(s) on {branch_name}")
 
                 # Notify human for review
+                if topic:
+                    intro = f"Hey! I looked at \"{topic}\" and made changes on branch `{branch_name}`."
+                else:
+                    intro = f"Hey! I did some coding on branch `{branch_name}`."
                 summary = (
-                    f"Hey! I did some coding on branch `{branch_name}`.\n"
+                    f"{intro}\n"
                     f"Changed files: {', '.join(all_changed)}\n"
                     f"Tools used: {', '.join(dict.fromkeys(tools_used)) if tools_used else 'none'}\n"
                     f"Have a look when you get a chance?"
@@ -1400,14 +1781,30 @@ class PulseEngine:
                 self._log_action("dev_tick", tools_used, f"branch: {branch_name}, files: {len(all_changed)}")
             else:
                 logger.info("Dev tick: no files changed.")
-                summary = (
-                    "I ran an autonomous dev tick; no files changed.\n"
-                    f"Tools used: {', '.join(dict.fromkeys(tools_used)) if tools_used else 'none'}"
-                )
-                if text:
-                    summary += f"\n\nMy notes: {text}"
-                self._save_dev_tick_to_history(summary)
-                self._log_action("dev_tick_noop", tools_used, "no changes")
+                if topic:
+                    # A requested investigation: report back even if nothing changed
+                    no_change_msg = f"I looked into \"{topic}\" but didn't change anything — "
+                    if text:
+                        no_change_msg += f"here's what I found:\n\n{text[:600]}"
+                    else:
+                        no_change_msg += "nothing actionable came out of it."
+                    telegram = self.channels.get("telegram")
+                    if telegram:
+                        await telegram.send(no_change_msg)
+                    toast = self.channels.get("toast")
+                    if toast:
+                        await toast.send(f"Dev tick: investigated \"{topic[:40]}\" — no changes")
+                    self._save_dev_tick_to_history(no_change_msg)
+                    self._log_action("dev_tick_noop", tools_used, f"investigated: {topic[:60]}")
+                else:
+                    summary = (
+                        "I ran an autonomous dev tick; no files changed.\n"
+                        f"Tools used: {', '.join(dict.fromkeys(tools_used)) if tools_used else 'none'}"
+                    )
+                    if text:
+                        summary += f"\n\nMy notes: {text}"
+                    self._save_dev_tick_to_history(summary)
+                    self._log_action("dev_tick_noop", tools_used, "no changes")
 
         except Exception as e:
             logger.error(f"Dev tick failed: {e}", exc_info=True)
@@ -1521,6 +1918,15 @@ class PulseEngine:
                 # Always check for due tasks (fast — just reads a file)
                 await self._check_due_tasks()
 
+                # Auto-recap check — silent background save when sessions wrap.
+                # Cheap when conditions aren't met (timestamp + DB read); only
+                # fires the LLM call when it's actually time to recap.
+                if self.auto_recap_enabled:
+                    try:
+                        await self.recap_task.maybe_run()
+                    except Exception as e:
+                        logger.error(f"Auto-recap check failed: {e}", exc_info=True)
+
                 # Heartbeat fires only after enough silence since last activity
                 silence = time.time() - self._last_activity
                 await self._run_idle_enrichment_once(silence)
@@ -1533,6 +1939,32 @@ class PulseEngine:
                     self._last_tick_summary = (response.message or "")[:120] if response else None
                     self.interval = self._roll_heartbeat_interval()
                     self._next_heartbeat_target = self._last_activity + self.interval
+
+                # Dev request queue — user-directed sessions, independent of
+                # the periodic dev_tick.enabled flag. Only process if this
+                # persona has the dev skill wired up (else we'd claim a
+                # request we can't execute).
+                if self.skill_registry and self.skill_registry.get_skill("dev"):
+                    try:
+                        claimed = self._claim_next_dev_request()
+                        if claimed:
+                            topic, why, claim_ts = claimed
+                            logger.info(f"Dev request claimed: {topic[:80]}")
+                            try:
+                                await self._do_dev_tick(topic=topic, why=why)
+                                self._finalize_dev_request(
+                                    claim_ts, "completed",
+                                    completed_at=datetime.now().isoformat(timespec="seconds"),
+                                )
+                            except Exception as ex:
+                                logger.error(f"Dev request execution failed: {ex}", exc_info=True)
+                                self._finalize_dev_request(
+                                    claim_ts, "failed",
+                                    failed_at=datetime.now().isoformat(timespec="seconds"),
+                                    error=str(ex)[:200],
+                                )
+                    except Exception as ex:
+                        logger.error(f"Dev request check failed: {ex}", exc_info=True)
 
                 # Dev tick — scheduled time or interval
                 if self.dev_tick_enabled:
