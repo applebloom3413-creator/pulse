@@ -14,6 +14,9 @@ pillow>=10.0                    # Image rendering for paint skill (pixel art →
 telegramify-markdown>=0.1.0     # Convert markdown → Telegram MarkdownV2 (rich formatting)
 mcp>=1.20                       # MCP bridge skill (optional — skill no-ops without servers configured)
 pypdf>=4.0                      # PDF text extraction for Telegram document messages
+google-api-python-client>=2.0   # Email skill (Gmail API; optional — only needed if the email skill is enabled)
+google-auth-httplib2>=0.2       # Email skill (OAuth transport)
+google-auth-oauthlib>=1.2       # Email skill (OAuth installed-app flow)
 
 # Note: plyer is an alternative to win11toast for cross-platform
 # pip install plyer

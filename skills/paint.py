@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 # --- Palette: named colors as emoji + RGB ---
 
 PALETTE = {
+    # ── Original colors ──
     "red":    {"emoji": "🟥", "rgb": (230, 57, 70)},
     "orange": {"emoji": "🟧", "rgb": (244, 162, 97)},
     "yellow": {"emoji": "🟨", "rgb": (241, 196, 15)},
@@ -38,8 +39,35 @@ PALETTE = {
     "gold":   {"emoji": "🟡", "rgb": (212, 175, 55)},
     "peach":  {"emoji": "🟠", "rgb": (255, 218, 185)},
     "mint":   {"emoji": "🟢", "rgb": (152, 219, 168)},
-    "sky":    {"emoji": "🩬", "rgb": (135, 206, 235)},
+    "sky":    {"emoji": "🩵", "rgb": (135, 206, 235)},
     "lavender": {"emoji": "🟣", "rgb": (181, 126, 220)},
+    # ── Lighter/darker shades, with evocative real-color names so they're
+    # memorable for the model (better than light_X / dark_X). Emojis reuse
+    # the closest parent-color square: the rendered PNG uses real RGB, the
+    # emoji is just for the canvas display, where exact shade doesn't have
+    # to match. ──
+    "crimson":   {"emoji": "🟥", "rgb": (153, 0, 30)},     # deep red
+    "rose":      {"emoji": "🩷", "rgb": (255, 192, 203)},  # soft pink-red
+    "coral":     {"emoji": "🟧", "rgb": (255, 127, 100)},  # pink-orange
+    "rust":      {"emoji": "🟫", "rgb": (183, 65, 14)},    # red-brown
+    "amber":     {"emoji": "🟧", "rgb": (255, 191, 0)},    # deep orange-yellow
+    "cream":     {"emoji": "🟨", "rgb": (255, 253, 208)},  # very pale yellow
+    "mustard":   {"emoji": "🟨", "rgb": (211, 168, 49)},   # deep mustard
+    "forest":    {"emoji": "🟩", "rgb": (34, 80, 34)},     # dark green
+    "sage":      {"emoji": "🟩", "rgb": (158, 175, 144)},  # muted gray-green
+    "lime":      {"emoji": "🟩", "rgb": (180, 230, 80)},   # bright yellow-green
+    "olive":     {"emoji": "🟫", "rgb": (107, 113, 53)},   # dark yellow-green
+    "teal":      {"emoji": "🟦", "rgb": (0, 128, 128)},    # blue-green
+    "navy":      {"emoji": "🟦", "rgb": (28, 45, 87)},     # dark blue
+    "ice":       {"emoji": "🩵", "rgb": (210, 235, 250)},  # very pale blue
+    "indigo":    {"emoji": "🟦", "rgb": (75, 0, 130)},     # deep blue-purple
+    "violet":    {"emoji": "🟪", "rgb": (190, 130, 255)},  # lighter purple
+    "plum":      {"emoji": "🟪", "rgb": (95, 35, 95)},     # dark purple-red
+    "magenta":   {"emoji": "🟪", "rgb": (255, 0, 144)},    # pink-purple
+    "tan":       {"emoji": "🟫", "rgb": (210, 180, 140)},  # light brown
+    "chocolate": {"emoji": "🟫", "rgb": (77, 38, 0)},      # dark brown
+    "charcoal":  {"emoji": "⬛", "rgb": (54, 54, 54)},     # dark gray
+    "silver":    {"emoji": "⬜", "rgb": (200, 200, 200)},  # light gray
 }
 
 EMPTY = "◻️"
@@ -100,21 +128,26 @@ class PaintSkill(BaseSkill):
                 "function": {
                     "name": "paint_start",
                     "description": (
-                        "Open a new blank canvas for painting. "
-                        "Only 16x16 is available for now. "
-                        "Use paint_view() to see the blank canvas."
+                        "Open a new blank canvas for painting. Sizes from "
+                        "4 to 32 in each dimension are supported, square "
+                        "or rectangular (default 16x16). Bigger canvases "
+                        "let you paint finer detail but cost more output "
+                        "tokens and get harder to perceive as a whole — "
+                        "16 is a comfortable default, 24-32 is for "
+                        "detailed work. Use paint_view() to see the "
+                        "blank canvas."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "width": {
                                 "type": "integer",
-                                "description": "Canvas width (currently only 16 is supported)",
+                                "description": "Canvas width, 4-32 (default 16).",
                                 "default": 16,
                             },
                             "height": {
                                 "type": "integer",
-                                "description": "Canvas height (currently only 16 is supported)",
+                                "description": "Canvas height, 4-32 (default 16).",
                                 "default": 16,
                             },
                             "intent": {
@@ -207,6 +240,47 @@ class PaintSkill(BaseSkill):
                     },
                 },
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_my_paintings",
+                    "description": (
+                        "Browse your gallery of past paintings. Returns titles, dates, "
+                        "captions, and intent for each one you've finished. Use this to "
+                        "see what you've made before — your work doesn't disappear into "
+                        "the void."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "limit": {
+                                "type": "integer",
+                                "description": "How many to show, most recent first (default 20)."
+                            },
+                        },
+                        "required": [],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "view_painting",
+                    "description": (
+                        "Re-send a past painting via Telegram so you can look at it again."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "title": {
+                                "type": "string",
+                                "description": "The title of the painting to re-send."
+                            },
+                        },
+                        "required": ["title"],
+                    },
+                },
+            },
         ]
 
     def execute(self, tool_name: str, arguments: dict) -> str:
@@ -230,15 +304,96 @@ class PaintSkill(BaseSkill):
                 title=arguments.get("title", ""),
                 caption=arguments.get("caption", ""),
             )
+        elif tool_name == "list_my_paintings":
+            return self._list_paintings(arguments.get("limit", 20))
+        elif tool_name == "view_painting":
+            return self._view_painting(arguments.get("title", ""))
         return f"Unknown paint tool: {tool_name}"
+
+    def _list_paintings(self, limit: int = 20) -> str:
+        """List past paintings from paintings.json index."""
+        index_path = self.paintings_dir / "paintings.json"
+        if not index_path.exists():
+            return "Your gallery is empty. Paint something!"
+        try:
+            import json as _json
+            entries = _json.loads(index_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            return f"Could not read gallery: {e}"
+        if not entries:
+            return "Your gallery is empty. Paint something!"
+        # Sort newest first
+        entries = sorted(entries, key=lambda e: e.get("created_at") or e.get("date") or "", reverse=True)
+        limit = min(int(limit or 20), 100)
+        shown = entries[:limit]
+        lines = [f"Your gallery — {len(entries)} painting{'s' if len(entries) != 1 else ''} total, showing {len(shown)}:"]
+        for e in shown:
+            when = (e.get("created_at") or e.get("date") or "")[:16].replace("T", " ")
+            title = e.get("title") or "(untitled)"
+            intent = (e.get("intent") or "").strip()
+            caption = (e.get("caption") or "").strip()
+            lines.append("")
+            lines.append(f"  • '{title}' — {when}")
+            if intent:
+                lines.append(f"      intent: {intent}")
+            if caption:
+                lines.append(f"      caption: {caption}")
+        return "\n".join(lines)
+
+    def _view_painting(self, title: str) -> str:
+        """Re-queue a past painting's PNG for sending via Telegram."""
+        title = (title or "").strip()
+        if not title:
+            return "Title required."
+        index_path = self.paintings_dir / "paintings.json"
+        if not index_path.exists():
+            return "No gallery yet."
+        try:
+            import json as _json
+            entries = _json.loads(index_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            return f"Could not read gallery: {e}"
+        # Find by title (case-insensitive, exact match preferred, partial fallback)
+        match = next((e for e in entries if (e.get("title") or "").lower() == title.lower()), None)
+        if not match:
+            match = next((e for e in entries if title.lower() in (e.get("title") or "").lower()), None)
+        if not match:
+            return f"No painting with title '{title}' in your gallery."
+        # Find the PNG file. Index entries store file names relative to the
+        # paintings folder ("upscaled_path", "true_path"); accept full paths too.
+        for key in ("upscaled_path", "png_path", "true_path", "image_path", "path"):
+            p = match.get(key)
+            if not p:
+                continue
+            candidate = Path(p) if Path(p).is_absolute() else self.paintings_dir / p
+            if candidate.exists():
+                self.pending_images.append(str(candidate))
+                return f"Re-sending '{match.get('title', '?')}'."
+        # Fallback: search the paintings dir for a matching file by title slug
+        slug = "".join(c if c.isalnum() else "_" for c in (match.get("title") or "")).strip("_")
+        for f in self.paintings_dir.glob(f"*{slug}*.png"):
+            self.pending_images.append(str(f))
+            return f"Re-sending '{match.get('title', '?')}'."
+        return f"Found the painting in the index but couldn't locate the PNG file on disk."
 
     # ---------------------------------------------------------------------
     # Tool implementations
     # ---------------------------------------------------------------------
 
     def _paint_start(self, width: int, height: int, intent: str) -> str:
-        if width != 16 or height != 16:
-            return "Only 16x16 canvas is supported right now."
+        # Allow rectangular canvases from 4 to 32 in each dimension. The
+        # upper limit isn't arbitrary: past ~32 the emoji grid stops being
+        # legible to the model as a coherent picture (the gestalt breaks
+        # down), and the multiline "paint the whole grid in one call"
+        # input format gets very expensive in output tokens. 16 stays the
+        # comfortable default; 24-32 is for detailed work.
+        if not (4 <= width <= 32 and 4 <= height <= 32):
+            return (
+                f"Canvas size {width}x{height} is out of range. Each "
+                f"dimension must be between 4 and 32 (default 16). Bigger "
+                f"canvases hold more detail but get harder to see as a "
+                f"whole, both for you and for whoever views the painting."
+            )
 
         if self.canvas_width and self.canvas:
             filled = len(self.canvas)
@@ -433,7 +588,12 @@ class PaintSkill(BaseSkill):
         canvas_img = self._render_png(self.canvas_width, self.canvas_height, scale=1)
 
         # --- Render upscaled PNG (nearest-neighbor for crispy pixels) ---
-        scale = TARGET_PX // self.canvas_width
+        # Scale by the LONGER dimension so the bigger side lands near
+        # TARGET_PX. Using width alone (the old way) made tall rectangles
+        # like 4x32 render at 384x3072 — absurdly long. With max() the
+        # image's longest side stays around 384 regardless of aspect.
+        longest = max(self.canvas_width, self.canvas_height)
+        scale = max(1, TARGET_PX // longest)
         upscaled_img = self._render_png(self.canvas_width, self.canvas_height, scale=scale)
 
         # --- Save ---

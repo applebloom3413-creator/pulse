@@ -598,6 +598,25 @@ class TelegramChannel(Channel):
         except Exception as e:
             logger.warning(f"Failed to send sticker: {e}")
 
+    async def send_document(self, doc_path: str, caption: str = ""):
+        """Send a file to the user via Telegram as a document (arbitrary MIME type).
+
+        Used for skills that produce files that shouldn't be sent as photos —
+        e.g. the `draw` skill sends .svg files this way so browsers can render
+        the vector art (Telegram would refuse an .svg as a photo).
+        """
+        if not self.app or not self.chat_id:
+            return
+        try:
+            with open(doc_path, "rb") as f:
+                await self.app.bot.send_document(
+                    chat_id=self.chat_id,
+                    document=InputFile(f),
+                    caption=caption[:1024] if caption else None,
+                )
+        except Exception as e:
+            logger.warning(f"Failed to send document: {e}")
+
     async def _send_voice(self, message, ogg_path: Path, retries: int = 3):
         """Send an OGG voice message and clean up the temp file.
 
@@ -699,6 +718,41 @@ class TelegramChannel(Channel):
             for img_path in garden_skill.pending_images:
                 await self.send_photo(img_path)
             garden_skill.pending_images.clear()
+
+        # Reactions — send reaction images
+        reactions_skill = self._engine.skill_registry.get_skill("reactions")
+        if reactions_skill and reactions_skill.pending_images:
+            for img_path in reactions_skill.pending_images:
+                await self.send_photo(img_path)
+            reactions_skill.pending_images.clear()
+
+        # Sticky notes — send rendered sticky images
+        sticky_skill = self._engine.skill_registry.get_skill("sticky")
+        if sticky_skill and sticky_skill.pending_images:
+            for img_path in sticky_skill.pending_images:
+                await self.send_photo(img_path)
+            sticky_skill.pending_images.clear()
+
+        # Games — send game board images
+        games_skill = self._engine.skill_registry.get_skill("games")
+        if games_skill and games_skill.pending_images:
+            for img_path in games_skill.pending_images:
+                await self.send_photo(img_path)
+            games_skill.pending_images.clear()
+
+        # Draw — send rendered PNGs inline first (Phase 2, preferred), then
+        # any remaining .svg documents (Phase 1 fallback when the PNG render
+        # failed or resvg-py wasn't available).
+        draw_skill = self._engine.skill_registry.get_skill("draw")
+        if draw_skill:
+            if getattr(draw_skill, "pending_images", None):
+                for img_path in draw_skill.pending_images:
+                    await self.send_photo(img_path)
+                draw_skill.pending_images.clear()
+            if getattr(draw_skill, "pending_documents", None):
+                for doc in draw_skill.pending_documents:
+                    await self.send_document(doc["path"], caption=doc.get("caption", ""))
+                draw_skill.pending_documents.clear()
 
         return voice_sent
 

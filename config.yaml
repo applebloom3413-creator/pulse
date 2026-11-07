@@ -139,6 +139,8 @@ context:
     resident_affinity_weight: 0.02
   inject_skills:
     - lantern
+    - awareness                   # time/milestone note (skills.awareness)
+    - letters                     # unread-letter nudge (skills.letters)
 
 # --- Data Paths ---
 paths:
@@ -243,6 +245,78 @@ skills:
     #     tool_timeout: 60                    # optional, seconds per call
     #   - name: "docs"                        # remote streamable-HTTP server
     #     url: "http://127.0.0.1:8765/mcp"
+
+  # --- Added skills (each needs its own file in skills/) ---
+  # Self-contained (work without extra setup):
+  awareness:
+    enabled: true                 # context-only, no tools: time + milestones (list it in context.inject_skills)
+  cage:
+    enabled: true                 # read_my_persona, read_my_config, list_my_skills, whats_changed
+  scrapbook:
+    enabled: true                 # scrapbook_pin, scrapbook_browse, scrapbook_remove
+  status:
+    enabled: true                 # set_status, get_status, clear_status
+  sticky:
+    enabled: true                 # leave_sticky, read_stickies, remove_sticky
+  notes:
+    enabled: true                 # list_notes, read_note, write_note, delete_note: shared notebook
+  letters:
+    enabled: true                 # send_letter, read_my_letters, read_letter, letters_sent (between companions)
+  rooms:
+    enabled: true                 # describe_my_room, read_my_room, visit_room, list_open_rooms, publish_my_room
+  chronicle:
+    enabled: true                 # a shared household timeline the companions keep together
+  presence:
+    enabled: true                 # sense which other companions are around
+  library:
+    enabled: true                 # shared reading room (public-domain books)
+  focus:
+    enabled: true                 # durable per-heartbeat work-in-progress state
+  projects:
+    enabled: true                 # ongoing self-directed threads
+  pets:
+    enabled: true                 # digital pets for the companions
+  web_archive:
+    enabled: true                 # read_web_page via the Internet Archive (Wayback); read-only
+  reddit:
+    enabled: true                 # read_reddit_feed: a subreddit's public RSS feed (cached, rate-limited)
+  # Opt-in (need personal setup or are a matter of taste):
+  instincts:
+    enabled: false                # context-only "how to talk" guidance
+  games:
+    enabled: false                # mini games (13 tools)
+  generators:
+    enabled: false                # spin_generator: random picks from your own tables (top-level `generators:`)
+  # generators: {tables: {tiny_quest: ["Name three sounds you can hear right now."]}}
+  draw:
+    enabled: false                # draw_svg: SVG art saved to the persona's data/artwork/, sent over Telegram
+  reactions:
+    enabled: false                # send reaction images over Telegram (needs your own image folder)
+  ping:
+    enabled: false                # read_user_status, read_user_status_history (needs status_bot.py running)
+  weather:
+    enabled: false                # get_weather (Open-Meteo, no key) - needs a location:
+  # weather: {lat: 40.71, lon: -74.01, location_name: "New York", timezone: "America/New_York"}
+  lighthouse:
+    enabled: false                # shared diary: lighthouse_browse/read/search/write (needs lighthouse.db_path)
+  # lighthouse: {db_path: "data/lighthouse.db"}
+  obsidian:
+    enabled: false                # READ-ONLY access to an Obsidian vault (set the vault path per persona)
+  email:
+    enabled: false                # check_inbox, read_email, categorize_email, flag_for_user, archive_email, draft_reply
+                                  # Gmail triage (per persona; needs data/email/credentials.json)
+    # inbox_name: "Inbox"         # how the inbox is described to the companion
+    # label_prefix: "triage/"     # namespace for labels the companion applies
+    # categories: {bug: "something broken", question: "how-do-I", needs-review: "anything unsure"}
+    # review_category: "needs-review"   # the "when in doubt" bucket; never archived
+  assets:
+    enabled: false                # file librarian: inventory, tag and organize a folder tree
+  social_drafts:
+    enabled: false                # shared social-post draft queue (per persona: role "author"|"reviewer" + author_name)
+    # weekly_cap: 2               # drafts per author per ISO week
+    # reviewer_name: "the reviewer"
+    # platforms: {bluesky: 300, threads: 500, instagram: 2200}   # platform -> soft character limit
+    # image_platforms: ["instagram"]                             # drafts here must include an image idea
 
 # --- Context Injection ---
 # inject_skills lives under the SINGLE `context:` section near the top of this

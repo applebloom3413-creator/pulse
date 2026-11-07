@@ -37,3 +37,13 @@ channels:
 # skills:
 #   lor:
 #     enabled: false
+
+# ── Tool-cap default (ACTIVE override, not just an example) ───────────
+# OpenAI rejects any request with more than 128 tools. Conversations and
+# heartbeats load most tools on demand, but scheduled tasks still send the
+# full tool list, and with every skill enabled that can pass the cap. `games`
+# (13 tools) is disabled here to keep new personas safely under it. If you're
+# cloning this for an Anthropic persona (no 128 cap), re-enable it freely.
+skills:
+  games:
+    enabled: false
