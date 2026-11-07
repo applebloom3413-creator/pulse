@@ -456,6 +456,22 @@ class AnthropicClient:
                     f"Prompt cache: {cache_read} read, {cache_create} created "
                     f"{breakdown} of {total} total tokens ({hit_pct}% hit)"
                 )
+        # Stop Watch: record this completion so classifier refusals and dropped
+        # replies are visible per persona. Runs on every success path (this
+        # method is called after each create()); never blocks a reply.
+        self._watch(response=response)
+
+    def _watch(self, response=None, error: str = ""):
+        """Record this completion (or failure) to the Stop Watch. Never raises.
+        Persona resolution, flagging and disk I/O all live in core/stop_watch.py,
+        which swallows its own errors too, so this stays a one-liner off the hot
+        path."""
+        try:
+            from core.stop_watch import record as _stopwatch_record
+            _stopwatch_record(self.model_name, response=response,
+                              error=error, usage_tracker=self._usage)
+        except Exception:
+            pass
 
     def _diagnostics_key(self, system) -> str:
         """Group related calls for Anthropic cache diagnostics comparisons."""
@@ -697,6 +713,7 @@ class AnthropicClient:
                     else:
                         self.last_error = f"Anthropic API error after 3 retries: {e}"
                         logger.error(self.last_error)
+                        self._watch(error=self.last_error)
                         return None
 
             if not response:
@@ -723,10 +740,12 @@ class AnthropicClient:
         except APIConnectionError:
             self.last_error = "Anthropic API not reachable"
             logger.warning(self.last_error)
+            self._watch(error=self.last_error)
             return None
         except Exception as e:
             self.last_error = f"Anthropic call failed: {e}"
             logger.error(self.last_error)
+            self._watch(error=self.last_error)
             return None
 
     def chat_with_tools(self, messages: list[dict], tools: list[dict],
@@ -796,6 +815,7 @@ class AnthropicClient:
                             time.sleep(wait)
                         else:
                             logger.error(f"Anthropic 500 after 3 attempts: {e}")
+                            self._watch(error=f"500 after 3 attempts: {e}")
                             return None, tools_used
 
                 if not response:
@@ -911,10 +931,12 @@ class AnthropicClient:
             except APIConnectionError:
                 self.last_error = "Anthropic API disconnected during tool loop"
                 logger.warning(self.last_error)
+                self._watch(error=self.last_error)
                 return None, tools_used
             except Exception as e:
                 self.last_error = f"Anthropic tool loop failed (round {round_num + 1}): {e}"
                 logger.error(self.last_error)
+                self._watch(error=self.last_error)
                 return None, tools_used
 
         # Exhausted rounds or loop force-stop — produce clean silent response
@@ -946,6 +968,7 @@ class AnthropicClient:
                     else:
                         self.last_error = f"Anthropic 500 in final response after 3 retries: {e}"
                         logger.error(self.last_error)
+                        self._watch(error=self.last_error)
                         return '{"action": "silent", "thinking": "Tool loop limit reached, wrapping up."}', tools_used
 
             if not response:
@@ -962,6 +985,7 @@ class AnthropicClient:
         except Exception as e:
             self.last_error = f"Final response after tool loop failed: {e}"
             logger.error(self.last_error)
+            self._watch(error=self.last_error)
 
         logger.warning("Forced final response was empty/failed — returning clean silent")
         return '{"action": "silent", "thinking": "Tool loop limit reached, wrapping up."}', tools_used

@@ -891,6 +891,12 @@ class PulseEngine:
         elapsed = time.time() - t0
         logger.info(f"LLM {source} reply took {elapsed:.1f}s (tools: {', '.join(tools_used) if tools_used else 'none'})")
 
+        # Record conversation tool use in the action log. Heartbeats have
+        # always logged theirs; without this, tools used only in conversation
+        # look unused in any usage audit. Same table, action="conversation".
+        if tools_used:
+            self._log_action("conversation", tools_used, f"{source}: {message[:80]}")
+
         # Capture the model's reasoning if it exposed any. The LLM client
         # populates `last_reasoning` from <think> tags / reasoning_content
         # / reasoning fields after every call. We pass it back so the
