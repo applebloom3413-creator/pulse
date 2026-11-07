@@ -244,6 +244,12 @@ skills:
     #   - name: "docs"                        # remote streamable-HTTP server
     #     url: "http://127.0.0.1:8765/mcp"
 
+  household_projects:
+    enabled: false                # shared multi-companion House Projects (relay)
+  dev_request:
+    enabled: false                # request_dev_session: queue a user-directed dev session
+  code:
+    enabled: false                # read/write access to your project folders (PULSE_CODE_ROOTS)
 # --- Context Injection ---
 # inject_skills lives under the SINGLE `context:` section near the top of this
 # file (next to `recall:`). YAML silently drops duplicate top-level keys — a

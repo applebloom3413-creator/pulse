@@ -1083,6 +1083,9 @@ class PulseEngine:
             if tools:
                 self._log_tool_payload_breakdown("scheduled_task", tools)
                 tool_mode, tool_budget = self._resolve_tool_loop_params()
+                # House-project (Workbench) turns need room to read, write AND hand off
+                if task.get("created_by") == "Workbench":
+                    tool_budget = max(tool_budget, 16)
                 text, tools_used = await asyncio.to_thread(
                     self.llm.chat_with_tools, messages, tools, self.skill_registry,
                     max_rounds=tool_budget, loop_mode=tool_mode, autonomous=True
@@ -1257,13 +1260,107 @@ class PulseEngine:
 
         return response
 
-    async def _do_dev_tick(self):
-        """Execute a dev tick — autonomous self-improvement session.
+    def _claim_next_dev_request(self):
+        """Claim the oldest pending dev request from the queue.
 
-        The companion gets agentic tools (read code, search, write skills) and
-        works on a git branch. Changes are validated and committed, then the
-        human is pinged for review. All writes are sandboxed to skills/ and
-        persona.json.
+        Returns (topic, why, claim_ts) or None if no pending requests.
+        Marks the claimed entry as 'claimed' and persists immediately so a
+        crash mid-tick doesn't double-process.
+        """
+        queue_path = Path(self._pulse_root) / "data" / "dev_requests.jsonl"
+        if not queue_path.exists():
+            return None
+
+        try:
+            text = queue_path.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning(f"Failed to read dev request queue: {e}")
+            return None
+
+        entries = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+        pending_idx = None
+        for i, e in enumerate(entries):
+            if e.get("status") == "pending":
+                pending_idx = i
+                break
+
+        if pending_idx is None:
+            return None
+
+        entries[pending_idx]["status"] = "claimed"
+        entries[pending_idx]["claimed_at"] = datetime.now().isoformat(timespec="seconds")
+        self._write_dev_queue(entries)
+
+        topic = entries[pending_idx].get("topic", "")
+        why = entries[pending_idx].get("why", "")
+        claim_ts = entries[pending_idx].get("ts", "")
+        return (topic, why, claim_ts)
+
+    def _finalize_dev_request(self, claim_ts: str, status: str, **extra):
+        """Mark the claimed request as completed or failed."""
+        queue_path = Path(self._pulse_root) / "data" / "dev_requests.jsonl"
+        if not queue_path.exists():
+            return
+
+        try:
+            text = queue_path.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning(f"Failed to finalize dev request: {e}")
+            return
+
+        entries = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+        for e in entries:
+            if e.get("ts") == claim_ts:
+                e["status"] = status
+                for k, v in extra.items():
+                    e[k] = v
+                break
+
+        self._write_dev_queue(entries)
+
+    def _write_dev_queue(self, entries):
+        """Rewrite the dev requests queue file."""
+        queue_path = Path(self._pulse_root) / "data" / "dev_requests.jsonl"
+        try:
+            queue_path.parent.mkdir(parents=True, exist_ok=True)
+            with queue_path.open("w", encoding="utf-8") as f:
+                for e in entries:
+                    f.write(json.dumps(e, ensure_ascii=False) + "\n")
+        except OSError as e:
+            logger.warning(f"Failed to write dev queue: {e}")
+
+    async def _do_dev_tick(self, topic: str = "", why: str = ""):
+        """Execute a dev tick — code session on an isolated git branch.
+
+        Two modes:
+        - Autonomous (topic=""): the companion roams the codebase and picks
+          what to work on. Fires on the periodic dev_tick schedule.
+        - Targeted (topic set): a user-directed request from the dev_request
+          queue; the agentic loop focuses on the topic. Fires whenever
+          there's a pending request, independent of the periodic
+          dev_tick.enabled flag.
+
+        Either way: agentic tools (read code, search, write skills);
+        writes sandboxed to skills/ + persona.json; changes go on a fresh
+        git branch; human gets pinged for review.
         """
         import subprocess
 
@@ -1299,12 +1396,28 @@ class PulseEngine:
                 ["git", "status", "--porcelain", "--", "skills/", "persona.json"],
                 capture_output=True, text=True, cwd=self._pulse_root
             )
-            if status.stdout.strip():
+            # Filter out untracked (??) entries — they don't conflict with
+            # branch ops (the dev tick checks out a branch, commits specific
+            # files, switches back; untracked stuff survives unchanged).
+            # Block only on MODIFIED tracked files in skills/ or persona.json.
+            dirty_tracked = [
+                line for line in status.stdout.splitlines()
+                if line.strip() and not line.startswith("??")
+            ]
+            if dirty_tracked:
                 self._save_dev_tick_to_history(
                     "I tried to run an autonomous dev tick, but skipped because "
                     "there were uncommitted changes in skills/ or persona.json."
                 )
-                logger.warning("Uncommitted changes in skills/ — skipping dev tick to avoid conflicts.")
+                logger.warning("Modified tracked files in skills/ — skipping dev tick to avoid conflicts.")
+                if topic:
+                    telegram = self.channels.get("telegram")
+                    if telegram:
+                        await telegram.send(
+                            f"Couldn't run \"{topic}\" — there are modified "
+                            f"files in skills/ that I'd conflict with. Commit "
+                            f"or stash them, then ask me again."
+                        )
                 return
 
             subprocess.run(
@@ -1333,8 +1446,8 @@ class PulseEngine:
 
             dev_registry = _DevRegistry()
 
-            # Build the dev tick prompt
-            messages = self.context.build_dev_prompt()
+            # Build the dev tick prompt (topic-aware when set)
+            messages = self.context.build_dev_prompt(topic=topic, why=why)
 
             # Run the agentic loop with dev tools only
             logger.info(f"Dev tick: {len(dev_tools)} tools available, max {self.dev_tick_max_rounds} rounds")
@@ -1369,7 +1482,12 @@ class PulseEngine:
                     cwd=self._pulse_root, check=True
                 )
 
-                commit_msg = f"[{persona_slug}-dev] {text[:100] if text else 'Dev tick changes'}"
+                if topic:
+                    commit_msg = f"[{persona_slug}-dev] {topic[:80]}"
+                    if text:
+                        commit_msg += f"\n\n{text[:300]}"
+                else:
+                    commit_msg = f"[{persona_slug}-dev] {text[:100] if text else 'Dev tick changes'}"
                 subprocess.run(
                     ["git", "commit", "-m", commit_msg],
                     capture_output=True, text=True, cwd=self._pulse_root, check=True
@@ -1377,8 +1495,12 @@ class PulseEngine:
                 logger.info(f"Dev tick committed {len(all_changed)} file(s) on {branch_name}")
 
                 # Notify human for review
+                if topic:
+                    intro = f"Hey! I looked at \"{topic}\" and made changes on branch `{branch_name}`."
+                else:
+                    intro = f"Hey! I did some coding on branch `{branch_name}`."
                 summary = (
-                    f"Hey! I did some coding on branch `{branch_name}`.\n"
+                    f"{intro}\n"
                     f"Changed files: {', '.join(all_changed)}\n"
                     f"Tools used: {', '.join(dict.fromkeys(tools_used)) if tools_used else 'none'}\n"
                     f"Have a look when you get a chance?"
@@ -1400,14 +1522,30 @@ class PulseEngine:
                 self._log_action("dev_tick", tools_used, f"branch: {branch_name}, files: {len(all_changed)}")
             else:
                 logger.info("Dev tick: no files changed.")
-                summary = (
-                    "I ran an autonomous dev tick; no files changed.\n"
-                    f"Tools used: {', '.join(dict.fromkeys(tools_used)) if tools_used else 'none'}"
-                )
-                if text:
-                    summary += f"\n\nMy notes: {text}"
-                self._save_dev_tick_to_history(summary)
-                self._log_action("dev_tick_noop", tools_used, "no changes")
+                if topic:
+                    # A requested investigation: report back even if nothing changed
+                    no_change_msg = f"I looked into \"{topic}\" but didn't change anything — "
+                    if text:
+                        no_change_msg += f"here's what I found:\n\n{text[:600]}"
+                    else:
+                        no_change_msg += "nothing actionable came out of it."
+                    telegram = self.channels.get("telegram")
+                    if telegram:
+                        await telegram.send(no_change_msg)
+                    toast = self.channels.get("toast")
+                    if toast:
+                        await toast.send(f"Dev tick: investigated \"{topic[:40]}\" — no changes")
+                    self._save_dev_tick_to_history(no_change_msg)
+                    self._log_action("dev_tick_noop", tools_used, f"investigated: {topic[:60]}")
+                else:
+                    summary = (
+                        "I ran an autonomous dev tick; no files changed.\n"
+                        f"Tools used: {', '.join(dict.fromkeys(tools_used)) if tools_used else 'none'}"
+                    )
+                    if text:
+                        summary += f"\n\nMy notes: {text}"
+                    self._save_dev_tick_to_history(summary)
+                    self._log_action("dev_tick_noop", tools_used, "no changes")
 
         except Exception as e:
             logger.error(f"Dev tick failed: {e}", exc_info=True)
@@ -1533,6 +1671,32 @@ class PulseEngine:
                     self._last_tick_summary = (response.message or "")[:120] if response else None
                     self.interval = self._roll_heartbeat_interval()
                     self._next_heartbeat_target = self._last_activity + self.interval
+
+                # Dev request queue — user-directed sessions, independent of
+                # the periodic dev_tick.enabled flag. Only process if this
+                # persona has the dev skill wired up (else we'd claim a
+                # request we can't execute).
+                if self.skill_registry and self.skill_registry.get_skill("dev"):
+                    try:
+                        claimed = self._claim_next_dev_request()
+                        if claimed:
+                            topic, why, claim_ts = claimed
+                            logger.info(f"Dev request claimed: {topic[:80]}")
+                            try:
+                                await self._do_dev_tick(topic=topic, why=why)
+                                self._finalize_dev_request(
+                                    claim_ts, "completed",
+                                    completed_at=datetime.now().isoformat(timespec="seconds"),
+                                )
+                            except Exception as ex:
+                                logger.error(f"Dev request execution failed: {ex}", exc_info=True)
+                                self._finalize_dev_request(
+                                    claim_ts, "failed",
+                                    failed_at=datetime.now().isoformat(timespec="seconds"),
+                                    error=str(ex)[:200],
+                                )
+                    except Exception as ex:
+                        logger.error(f"Dev request check failed: {ex}", exc_info=True)
 
                 # Dev tick — scheduled time or interval
                 if self.dev_tick_enabled:

@@ -1693,11 +1693,16 @@ You decide when to lift the timeout — not the human."""
         ])
         return messages
 
-    def build_dev_prompt(self) -> list[dict]:
-        """Build a prompt for a dev tick — autonomous self-improvement session.
+    def build_dev_prompt(self, topic: str = "", why: str = "") -> list[dict]:
+        """Build a prompt for a dev tick.
 
         This gives the companion a focused coding persona and clear constraints
-        about what it can and cannot do.
+        about what it can and cannot do. Two modes:
+        - Free roam (topic=""): autonomous self-improvement; the companion
+          picks what to work on from the codebase + dev journal.
+        - Targeted (topic set): the user (via the dev_request skill) asked the
+          companion to investigate something specific. Same safety envelope;
+          the agentic loop is focused on that topic instead of roaming.
         """
         local_now = datetime.now()
         time_str = local_now.strftime('%A, %B %d, %Y at %I:%M %p')
@@ -1782,13 +1787,31 @@ You decide when to lift the timeout — not the human."""
         if journal_summary:
             user_msg += f"## Recent Dev Journal\n{journal_summary}\n\n"
 
-        user_msg += (
-            "## Your Turn\n"
-            "This is your dev session. Start by reading your dev journal, "
-            "then explore the codebase and decide what to work on.\n"
-            "When you're done (or if you decide to do nothing), give a brief summary "
-            "of what you did or why you chose to skip this session."
-        )
+        if topic:
+            user_msg += "## Your Turn — Targeted Investigation\n"
+            user_msg += f"{self.user_name} asked you to look at this specifically:\n\n> {topic}\n\n"
+            if why:
+                user_msg += f"Why it came up: {why}\n\n"
+            user_msg += (
+                "This isn't a free-roam session. Start by reading your dev "
+                "journal (always), then use read_source and search_code to "
+                "dig into the topic above. If you find the cause AND it's in "
+                "your write scope (skills/ + persona.json), try to fix it. "
+                "If the cause is in core/ or somewhere you can't touch, "
+                "that's fine — write up what you found and stop there. A "
+                "clear diagnosis is more useful than a half-finished fix.\n\n"
+                "When you're done, give a brief summary: what you looked at, "
+                "what you found, what you changed (if anything), and what's "
+                f"still open. {self.user_name} will see this with your branch."
+            )
+        else:
+            user_msg += (
+                "## Your Turn\n"
+                "This is your dev session. Start by reading your dev journal, "
+                "then explore the codebase and decide what to work on.\n"
+                "When you're done (or if you decide to do nothing), give a brief summary "
+                "of what you did or why you chose to skip this session."
+            )
 
         return [
             {"role": "system", "content": system},
